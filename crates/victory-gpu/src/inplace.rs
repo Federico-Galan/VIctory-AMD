@@ -104,6 +104,38 @@ fn most() -> u64 {
 /// because of [`most`]; and what was let go because its memory changed.
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+/// Secondary `MapViewOfFile` address mapped over a contiguous section stretch,
+/// unmapped when the placed heap and resource above it have dropped.
+pub(crate) struct StretchView(usize);
+
+impl StretchView {
+    pub(crate) fn none() -> Self {
+        Self(0)
+    }
+}
+
+impl Drop for StretchView {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            // SAFETY: view mapped by `MapViewOfFile` in `place_stretch`; declared
+            // after `buffer` and `heap`/`place`, so D3D12 has released both first.
+            unsafe {
+                mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.0 as *mut c_void,
+                });
+            }
+        }
+    }
+}
+
+/// Stretches shorter than this stay copied (`VICTORY_STRETCH=0` turns it off).
+const STRETCH_LEAST: usize = 4 << 20;
+
+fn stretch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRETCH").is_none_or(|v| v != "0"))
+}
+
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
     pub(crate) buffer: ID3D12Resource,
@@ -112,6 +144,7 @@ pub(crate) struct Placed {
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    pub(crate) stretch: StretchView,
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -128,19 +161,65 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, bias: start - at, stretch: StretchView::none() })
+}
+
+/// Maps `[offset, offset + bytes)` of `section` once more at an address of
+/// ours so a stretch of 64 KiB section views can be opened as one heap.
+fn place_stretch(
+    device: &ID3D12Device,
+    start: u64,
+    at: u64,
+    bytes: u64,
+    section: usize,
+    offset: u64,
+) -> Result<Placed, Option<windows::core::Error>> {
+    // SAFETY: committed section the runtime reported, alive while its views exist.
+    let view = unsafe {
+        mem::MapViewOfFile(
+            section as _,
+            mem::FILE_MAP_WRITE,
+            (offset >> 32) as u32,
+            offset as u32,
+            bytes as usize,
+        )
+    };
+    if view.Value.is_null() {
+        return Err(None);
+    }
+    let stretch = StretchView(view.Value as usize);
+    // Read-only guards would refuse the GPU's writes.
+    crate::watch::writing(at as usize, bytes as usize);
+    let heap = open(device, From::Part(view.Value as usize, bytes as usize)).map_err(Some)?;
+    let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 32 || count.is_power_of_two() {
+        tracing::info!(
+            count,
+            start = format_args!("{at:#x}"),
+            bytes,
+            "title memory in place through a view of ours"
+        );
+    }
+    Ok(Placed { buffer, heap, gpu, bias: start - at, stretch })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if level() < if window { 1 } else { 2 } {
-        return None;
-    }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
+    let in_place = level() >= if window { 1 } else { 2 };
+    let at = start & !(K64 as u64 - 1);
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let cover = cover(at as usize, bytes as usize);
+    let try_stretch = window
+        && matches!(cover, Cover::Run(..))
+        && bytes as usize >= STRETCH_LEAST
+        && stretch_on();
+    if !in_place && !try_stretch {
         return None;
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
@@ -148,7 +227,19 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let res = match cover {
+        Cover::None => place_part(&host.device, start, len),
+        Cover::Run(section, offset) if try_stretch => {
+            place_stretch(&host.device, start, at, bytes, section, offset)
+        }
+        _ => {
+            if in_place {
+                STATS[4].fetch_add(1, Ordering::Relaxed);
+            }
+            return None;
+        }
+    };
+    match res {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);

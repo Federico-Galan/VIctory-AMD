@@ -171,24 +171,24 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
         made.clear();
     }
     let key = (tenths, format.0, scale);
-    if !made.contains_key(&key) {
-        let (w, h, lit) = bitmap(&text(tenths), scale);
-        let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
-        let Some((buffer, data)) = host.shared_buffer((pitch * h as usize) as u64) else {
-            return;
-        };
-        // SAFETY: the buffer's own mapped bytes, `pitch * h` of them.
-        let out = unsafe { std::slice::from_raw_parts_mut(data, pitch * h as usize) };
-        for y in 0..h as usize {
-            for x in 0..w as usize {
-                let at = y * pitch + x * bytes;
-                pixel(format, lit[y * w as usize + x], &mut out[at..at + bytes]);
+    let m = match made.entry(key) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let (w, h, lit) = bitmap(&text(tenths), scale);
+            let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
+            let Some((buffer, data)) = host.shared_buffer((pitch * h as usize) as u64) else {
+                return;
+            };
+            // SAFETY: the buffer's own mapped bytes, `pitch * h` of them.
+            let out = unsafe { std::slice::from_raw_parts_mut(data, pitch * h as usize) };
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let at = y * pitch + x * bytes;
+                    pixel(format, lit[y * w as usize + x], &mut out[at..at + bytes]);
+                }
             }
+            e.insert(Made { buffer, width: w, height: h, pitch: pitch as u32 })
         }
-        made.insert(key, Made { buffer, width: w, height: h, pitch: pitch as u32 });
-    }
-    let Some(m) = made.get(&key) else {
-        return;
     };
     let margin = 4 * scale;
     if m.width + 2 * margin > width || m.height + 2 * margin > height {
