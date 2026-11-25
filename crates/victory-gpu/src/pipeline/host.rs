@@ -958,14 +958,28 @@ fn root_signature(
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
         if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
-            if let Some(error) = error {
-                let text = std::slice::from_raw_parts(
-                    error.GetBufferPointer().cast::<u8>(),
-                    error.GetBufferSize(),
-                );
-                tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
+            let fallback_desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+                Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
+                Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                    Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                        NumParameters: params.len() as u32,
+                        pParameters: params.as_ptr(),
+                        NumStaticSamplers: samplers.len() as u32,
+                        pStaticSamplers: samplers.as_ptr(),
+                        Flags: input,
+                    },
+                },
+            };
+            if D3D12SerializeVersionedRootSignature(&fallback_desc, &mut blob, None).is_err() {
+                if let Some(error) = error {
+                    let text = std::slice::from_raw_parts(
+                        error.GetBufferPointer().cast::<u8>(),
+                        error.GetBufferSize(),
+                    );
+                    tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
+                }
+                return Err(e);
             }
-            return Err(e);
         }
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =

@@ -224,8 +224,21 @@ impl Host {
         unsafe {
             let mut blob = None;
             let mut error = None;
-            D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
-                .map_err(err)?;
+            if D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)).is_err() {
+                let fallback_desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+                    Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+                    Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                        Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                            NumParameters: params.len() as u32,
+                            pParameters: params.as_ptr(),
+                            NumStaticSamplers: samplers.len() as u32,
+                            pStaticSamplers: samplers.as_ptr(),
+                            Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+                        },
+                    },
+                };
+                D3D12SerializeVersionedRootSignature(&fallback_desc, &mut blob, None).map_err(err)?;
+            }
             let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
             let bytes = std::slice::from_raw_parts(
                 blob.GetBufferPointer().cast::<u8>(),

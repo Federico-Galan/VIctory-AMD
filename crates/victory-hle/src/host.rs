@@ -43,6 +43,7 @@ impl Default for HostPolicy {
             "msvcp_win.dll",
             "ole32.dll",
             "advapi32.dll",
+            "rpcrt4.dll",
             "iphlpapi.dll",
             // The title's crash handler writes minidumps with it (loaded by name).
             "dbghelp.dll",
