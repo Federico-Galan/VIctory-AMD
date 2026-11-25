@@ -657,7 +657,25 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        tracing::info!("host D3D12 device ready");
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        let _ = device.CheckFeatureSupport(
+            D3D12_FEATURE_SHADER_MODEL,
+            (&raw mut sm).cast(),
+            size_of_val(&sm) as u32,
+        );
+        let adapter_name = adapter
+            .as_ref()
+            .and_then(|a| a.cast::<IDXGIAdapter1>().ok())
+            .and_then(|a1| unsafe { a1.GetDesc1().ok() })
+            .map(|d| String::from_utf16_lossy(&d.Description))
+            .unwrap_or_else(|| "Unknown".to_owned());
+        tracing::info!(
+            adapter = adapter_name.trim_end_matches('\0'),
+            sm = format_args!("{:#x}", sm.HighestShaderModel.0),
+            "host D3D12 device ready"
+        );
         Ok(Host {
             device,
             queue,

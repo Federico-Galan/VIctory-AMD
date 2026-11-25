@@ -14,6 +14,20 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+#[cfg(windows)]
+#[repr(transparent)]
+pub struct ExportPtr(pub *const std::ffi::c_char);
+#[cfg(windows)]
+unsafe impl Sync for ExportPtr {}
+
+#[cfg(windows)]
+#[unsafe(export_name = "D3D12SDKVersion")]
+pub static D3D12SDK_VERSION: u32 = 614;
+
+#[cfg(windows)]
+#[unsafe(export_name = "D3D12SDKPath")]
+pub static D3D12SDK_PATH: ExportPtr = ExportPtr(c".\\D3D12\\".as_ptr());
+
 #[derive(Parser)]
 #[command(
     name = "victory",
