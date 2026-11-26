@@ -401,8 +401,21 @@ impl<'a> Lower<'a> {
             let off = self.is_nan_f32(bx[0]);
             let on = self.s.m.bool(true);
             let on = self.s.m.bin(c, Bin::Xor, off, on);
+            // Reject all-zero unmapped-page / Box32 page-straddle entries where
+            // `child == 0` AND all box bounds are 0 (prevents infinite BVH traversal
+            // loops on unmapped sparse memory while preserving synthetic tests that
+            // use child index 0 with non-zero box bounds).
+            let zero_i32 = self.s.m.i32(0);
+            let child_zero = self.s.m.cmp(c, pred::EQ, children[n], zero_i32);
+            let mut all_zero = child_zero;
+            for j in 0..6 {
+                let coord_zero = self.s.m.cmp(c, pred::OEQ, bx[j], fzero);
+                all_zero = self.s.m.bin(c, Bin::And, all_zero, coord_zero);
+            }
+            let valid_child = self.s.m.bin(c, Bin::Xor, all_zero, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
             let hit = self.s.m.bin(c, Bin::And, hit, on);
+            let hit = self.s.m.bin(c, Bin::And, hit, valid_child);
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }

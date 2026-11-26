@@ -48,6 +48,9 @@ cbuffer Record : register(b0) {
     // run is left empty and costs nothing. Bit 2: the records are gathered
     // (`gather`): record i lies in the source where word i of the table
     // behind `count_buf` says (from `count_offset` on), and goes to slot i.
+    // Bit 3: dispatch records spread across z past 65,535 groups in x
+    // (`crate::draw`'s spread command signature): record i goes to byte
+    // 20 * i as [row, asked x, x, y, z], row 0 when not spread.
     uint has_count;
     uint count_offset;
 };
@@ -92,6 +95,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         src_at = count_buf.Load(count_offset + id.x * 4u);
     }
     uint dst_at = id.x * stride;
+    bool spread = (has_count & 8u) != 0;
+    uint row = 0;
+    uint asked_x = 0;
+    if (spread) {
+        dst_at = id.x * 20u;
+    }
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -126,7 +135,28 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 raw = src_args.Load3(src_at);
+        // Diagnostics: what the record asked for before the clamp (one
+        // dispatch runs at most 65,535 groups a dimension; run 200 saw
+        // compute records ask 77,000 to 98,000 in x). A record ahead of
+        // its dispatch the title has not filled is not counted.
+        asked = max(raw.x, max(raw.y, raw.z));
+        if (ahead && asked > (1u << 24)) {
+            asked = 0;
+        }
+        uint3 g;
+        asked_x = raw.x;
+        // Past 65,535 groups in x (one row): spread across z, the program
+        // takes (x + z * row, y, 0) and leaves past `asked_x` (after
+        // upstream VIctory pull request #2312).
+        if (spread && raw.x > 65535u && raw.y >= 1u && raw.y <= 65535u && raw.z == 1u
+            && !(ahead && raw.x > (1u << 24))) {
+            uint rows = (raw.x + 65534u) / 65535u;
+            row = (raw.x + rows - 1u) / rows;
+            g = uint3(row, raw.y, rows);
+        } else {
+            g = min(raw, uint3(65535u, 65535u, 65535u));
+        }
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -216,9 +246,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (over) {
             groups = uint3(0, 0, 0);
         }
-        dst_args.Store3(dst_at, groups);
-        for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        if (spread) {
+            dst_args.Store2(dst_at, uint2(row, asked_x));
+            dst_args.Store3(dst_at + 8u, groups);
+        } else {
+            dst_args.Store3(dst_at, groups);
+            for (uint off = 12; off < stride; off += 4) {
+                dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            }
         }
     }
 }
@@ -348,10 +383,13 @@ pub(crate) fn bound(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
+    spread: bool,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    // Spread dispatch records are 20 bytes each ([row, asked x, x, y, z]).
+    let bytes = if spread { bytes.max(20 * u64::from(spec.2)) } else { bytes };
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, count, spec, false, spread).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -371,7 +409,7 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, true, false).then_some(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -387,9 +425,10 @@ fn clamp_into(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
     ahead: bool,
+    spread: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let recorded = record_clamp_with(c, &list.list, (dst, before), budget, src, count, spec, ahead, spread);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -405,12 +444,30 @@ fn clamp_into(
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
+    dst: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_with(c, l, dst, budget, src, count, spec, ahead, false)
+}
+
+/// [`record_clamp_as`]; `spread`: dispatch records past 65,535 groups in x
+/// are spread across z, every record written as [row, asked x, x, y, z]
+/// (20 bytes) for `crate::draw`'s spread command signature.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_with(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    spread: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -455,7 +512,14 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [
+        kind,
+        stride,
+        records,
+        args_offset,
+        has_count | (u32::from(ahead) << 1) | (u32::from(spread && kind == 2) << 3),
+        count_offset,
+    ];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
