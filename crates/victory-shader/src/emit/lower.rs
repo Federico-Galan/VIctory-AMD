@@ -888,6 +888,38 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     if (0..n).any(|r| reads[r] && writes[r]) {
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+                let mut list = Vec::new();
+                for (b, block) in p.blocks.iter().enumerate().take(n) {
+                    if all[b] || find(&mut region, b) != r {
+                        continue;
+                    }
+                    for i in &block.insts {
+                        let name = i.name();
+                        if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
+                            continue;
+                        }
+                        // the address register and the instruction that wrote it
+                        let addr = match &i.fields {
+                            Fields::Ds { addr: Some(Operand::Vector { reg, .. }), offset0, offset1, .. } => {
+                                let made = i.read(Reg::V(*reg)).and_then(|v| {
+                                    p.blocks
+                                        .iter()
+                                        .flat_map(|bl| &bl.insts)
+                                        .find(|x| x.writes.iter().any(|w| w.1 == v))
+                                        .map(|x| format!("{:#x} {}", x.machine.offset, x.name()))
+                                });
+                                format!("v{reg} off {offset0}/{offset1} made by {}", made.as_deref().unwrap_or("an input or a phi"))
+                            }
+                            _ => "no address".to_string(),
+                        };
+                        list.push(format!("{:#x} {name} [{addr}]", i.machine.offset));
+                    }
+                }
+                eprintln!("WAVE64-LDS region with reads and writes: {}", list.join("; "));
+            }
+        }
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -8408,15 +8440,20 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit result outside a VGPR");
         };
         let mut high = v.opsel >> 3 & 1 != 0;
-        // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
+        // SDWA: the word written, the other one kept (preserve), bit 15
+        // copied upward (sext: dst_unused 1 with WORD_0), or zero (pad; a sign
+        // extension above the high word or a whole dword adds nothing). The
+        // reserved dst_unused 3 is refused. (Upstream VIctory #3124: a 16-bit
+        // -1 written with sext came out as 0x0000FFFF.)
         let mut keep = true;
+        let mut sext = false;
         if let Some(sd) = v.sdwa {
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+                (4, 1) => (keep, sext) = (false, true),
+                (4, 0) | (6, 0..=2) => keep = false,
+                (5, 0 | 1) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
         }
@@ -8427,7 +8464,10 @@ impl<'a> Lower<'a> {
         };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
         let x = self.s.m.bin(c, Bin::And, x, low);
-        let r = if high {
+        let r = if sext {
+            let t = self.s.m.bin(c, Bin::Shl, x, k16);
+            self.s.m.bin(c, Bin::AShr, t, k16)
+        } else if high {
             let o = self.s.m.bin(c, Bin::And, old, low);
             let x = self.s.m.bin(c, Bin::Shl, x, k16);
             self.s.m.bin(c, Bin::Or, o, x)
