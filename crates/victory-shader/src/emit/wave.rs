@@ -831,6 +831,59 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     Some(Shape::Prefix(op, src, mask, ident, inclusive))
 }
 
+/// When `VICTORY_WAVE_WHY` is set: logs regions where LDS reads and writes meet.
+pub(crate) fn log_lds_conflicts(
+    p: &crate::ir::Program,
+    all: &[bool],
+    n: usize,
+    reads: &[bool],
+    writes: &[bool],
+    mut region: Vec<usize>,
+    find: impl Fn(&mut [usize], usize) -> usize,
+) {
+    for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+        let mut list = Vec::new();
+        for (b, block) in p.blocks.iter().enumerate().take(n) {
+            if all[b] || find(&mut region, b) != r {
+                continue;
+            }
+            for i in &block.insts {
+                let name = i.name();
+                if !matches!(i.fields, Fields::Ds { .. })
+                    || name.starts_with("ds_swizzle")
+                    || name.contains("permute")
+                {
+                    continue;
+                }
+                // the address register and the instruction that wrote it
+                let addr = match &i.fields {
+                    Fields::Ds {
+                        addr: Some(Operand::Vector { reg, .. }),
+                        offset0,
+                        offset1,
+                        ..
+                    } => {
+                        let made = i.read(Reg::V(*reg)).and_then(|v| {
+                            p.blocks
+                                .iter()
+                                .flat_map(|bl| &bl.insts)
+                                .find(|x| x.writes.iter().any(|w| w.1 == v))
+                                .map(|x| format!("{:#x} {}", x.machine.offset, x.name()))
+                        });
+                        format!(
+                            "v{reg} off {offset0}/{offset1} made by {}",
+                            made.as_deref().unwrap_or("an input or a phi")
+                        )
+                    }
+                    _ => "no address".to_string(),
+                };
+                list.push(format!("{:#x} {name} [{addr}]", i.machine.offset));
+            }
+        }
+        eprintln!("WAVE64-LDS region with reads and writes: {}", list.join("; "));
+    }
+}
+
 /// `WaveActiveBitOr(v7)` into s7 as the console compiler expands it: every lane takes part,
 /// those outside the saved EXEC (s[4:5]) with 0.
 #[cfg(test)]
@@ -1265,7 +1318,7 @@ mod tests {
         let (zero_shape, v0_in, saved) = run(128);
         assert_eq!(
             zero_shape,
-            Some(Shape::Half(Op::AddH, v0_in, saved, 0, 31))
+            Some(Shape::Active(Op::AddH, v0_in, saved, 0))
         );
         for c in 240..=248u16 {
             let (shape, _, _) = run(c);

@@ -3674,7 +3674,7 @@ fn spread_on() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = (std::time::Instant::now().elapsed().as_secs() / 20) % 2 == 0;
+            let on = (std::time::Instant::now().elapsed().as_secs() / 20).is_multiple_of(2);
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(

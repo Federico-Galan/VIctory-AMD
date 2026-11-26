@@ -2068,13 +2068,13 @@ void main() {
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`, which stays readable
         // as arguments between them.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), false).unwrap();
         assert_eq!(
             list.indirect_state(&b1),
             args,
             "a clamp leaves the scratch readable as arguments"
         );
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), false).unwrap();
         assert_eq!(
             b1.as_raw(),
             b2.as_raw(),
@@ -2090,7 +2090,7 @@ void main() {
             D3D12_RESOURCE_STATE_COMMON,
             "a new scratch buffer is common"
         );
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
+        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), false).unwrap();
         assert_eq!(b3.as_raw(), grown.as_raw());
         assert_ne!(
             b3.as_raw(),
@@ -2120,7 +2120,7 @@ void main() {
             D3D12_RESOURCE_STATE_COMMON,
             "a reset list starts with a common scratch buffer"
         );
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), false).unwrap();
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),
@@ -2262,8 +2262,8 @@ void main() {
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
-            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3), false).unwrap();
+            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), false).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
             unsafe {
@@ -2284,7 +2284,7 @@ void main() {
         }
         // A recording with only the small record: the budget is empty
         // again, so it runs.
-        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), false).unwrap();
         // SAFETY: as above.
         unsafe {
             list.list.SetComputeRootSignature(&worker.root);

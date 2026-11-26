@@ -631,7 +631,7 @@ fn bc1_residual(t: &Tables, s: &[u8]) -> Plain {
     for (k, bits) in [5, 6, 5, 5, 6, 5].into_iter().enumerate() {
         v.ep[k] = zz(s[2 + k], bits);
     }
-    quads(t.rank1, s[8..12].try_into().unwrap(), (&mut v.ix[..16]).try_into().unwrap());
+    quads(&t.rank1, s[8..12].try_into().unwrap(), (&mut v.ix[..16]).try_into().unwrap());
     v
 }
 
@@ -651,7 +651,7 @@ fn bc3_residual(t: &Tables, s: &[u8]) -> Plain {
         ..Default::default()
     };
     pairs(&t.rank3a, &s[6..14], &mut v.ix[..16]);
-    quads(t.rank3c, s[20..24].try_into().unwrap(), (&mut v.ix[16..]).try_into().unwrap());
+    quads(&t.rank3c, s[20..24].try_into().unwrap(), (&mut v.ix[16..]).try_into().unwrap());
     v
 }
 
