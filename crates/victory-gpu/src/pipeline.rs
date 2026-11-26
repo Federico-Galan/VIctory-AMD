@@ -61,6 +61,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// It is left out: it animates or draws hair strands ([`hair_strands`]),
+    /// or serves rays that do not run ([`idle_without_rays`]).
+    #[cfg(windows)]
+    hair: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -111,6 +115,62 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// Whether a container's program only makes sense with the title's rays,
+/// which do not run (`VICTORY_RAYS` has them run, and it with them): the
+/// program that tells the screen probes which rays to trace.
+/// shortcut: left out. The AMD driver never ended its pipeline until the
+/// clean-up passes shortened it; once it ran, with no rays behind it, the
+/// whole picture lost light, shadows and reflections (run opt31b against
+/// sans39, 2026-11-25).
+#[cfg(windows)]
+fn idle_without_rays(container: &[u8]) -> bool {
+    const NAME: &[u8] = b"CS_ScreenProbes_ActivateRays";
+    !victory_shader::emit::rays() && container.windows(NAME.len()).any(|w| w == NAME)
+}
+
+/// Whether a container's program is one of those that animate and draw hair
+/// strands, by its name. By default hair strands run; `VICTORY_SKIP_HAIR=1`
+/// (or `VICTORY_HAIR=0`) skips them for debugging on low-end hardware.
+/// Scene details such as decals and LOD blending always run.
+#[cfg(windows)]
+fn hair_strands(container: &[u8]) -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    if !*SKIP.get_or_init(|| {
+        std::env::var_os("VICTORY_SKIP_HAIR").is_some_and(|v| v == "1")
+            || std::env::var_os("VICTORY_HAIR").is_some_and(|v| v == "0")
+    }) {
+        return false;
+    }
+    const NAMES: [&[u8]; 13] = [
+        b"InterpolateStrand",
+        b"HairStrand",
+        b"CS_VisHair",
+        b"PS_Smh",
+        b"CS_InitSimBuffer",
+        b"CS_PreSkinSim",
+        b"CS_SolvePer",
+        b"CS_WavePerSpline",
+        b"CS_EstimateStartPosition",
+        b"CS_CachePrev",
+        b"CS_RestoreSimVelocity",
+        b"CS_UpdatePosePosition",
+        b"CSGenerateHair",
+    ];
+    const END: &[u8] = b"_Wrapped";
+    container
+        .windows(END.len())
+        .enumerate()
+        .filter(|(_, w)| *w == END)
+        .any(|(at, _)| {
+            let before = &container[at.saturating_sub(100)..at];
+            let name = before
+                .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                .next()
+                .unwrap_or_default();
+            NAMES.iter().any(|n| name.windows(n.len()).any(|w| w == *n))
+        })
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -125,6 +185,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                hair: hair_strands(bytes) || idle_without_rays(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
@@ -520,7 +582,7 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -540,23 +602,20 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
-    if hashes.is_empty() {
-        return None;
-    }
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| shader.hair || !hashes.is_empty() && hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }

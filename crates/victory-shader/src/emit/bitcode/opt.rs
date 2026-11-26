@@ -52,10 +52,19 @@ pub const LOADS: u32 = 16;
 /// half has a lane where every lane is in EXEC (`lower.rs`,
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
+/// Not a pass over the module either: the lowering reads the dwords of one
+/// console load (`s_buffer_load_dwordx2` to `x16` from an SRV, a
+/// `global_load_dwordx2` to `x4`) by one call for every four of them, not
+/// by a call each (`lower.rs`, `raw_dwords`). The same bytes are read.
+pub const WIDE: u32 = 64;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const ALL: u32 = MODULE | FIRST;
+pub const ALL: u32 = MODULE | FIRST | WIDE;
+/// The passes that run when nothing says which: every one but [`WIDE`],
+/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
+/// for it).
+pub const DEFAULT: u32 = ALL & !WIDE;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -388,7 +397,7 @@ impl Module {
     }
 
     /// An integer constant's width and value (the bits of that width).
-    fn int_k(&self, v: V) -> Option<(u32, u64)> {
+    pub(crate) fn int_k(&self, v: V) -> Option<(u32, u64)> {
         let V::Const(i) = v else { return None };
         let (ty, Const::Int(x)) = &self.consts[i as usize] else {
             return None;
@@ -440,19 +449,99 @@ impl Module {
                         Bin::Add | Bin::Sub | Bin::Or | Bin::Xor | Bin::Shl | Bin::LShr | Bin::AShr,
                         _,
                         Some(0),
-                    ) => Some(a),
-                    (Bin::Add | Bin::Or | Bin::Xor, Some(0), _) => Some(b),
-                    (Bin::Mul | Bin::UDiv, _, Some(1)) => Some(a),
-                    (Bin::Mul, Some(1), _) => Some(b),
-                    (Bin::Mul | Bin::And, _, Some(0)) => Some(b),
-                    (Bin::Mul | Bin::And, Some(0), _) => Some(a),
-                    (Bin::And, _, Some(m)) if m == all => Some(a),
-                    (Bin::And, Some(m), _) if m == all => Some(b),
-                    (Bin::Or, _, Some(m)) if m == all => Some(b),
-                    (Bin::Or, Some(m), _) if m == all => Some(a),
-                    (Bin::And | Bin::Or, _, _) if a == b => Some(a),
-                    _ => None,
+                    ) => return Some(a),
+                    (Bin::Add | Bin::Or | Bin::Xor, Some(0), _) => return Some(b),
+                    (Bin::Mul | Bin::UDiv, _, Some(1)) => return Some(a),
+                    (Bin::Mul, Some(1), _) => return Some(b),
+                    (Bin::Mul | Bin::And, _, Some(0)) => return Some(b),
+                    (Bin::Mul | Bin::And, Some(0), _) => return Some(a),
+                    (Bin::And, _, Some(m)) if m == all => return Some(a),
+                    (Bin::And, Some(m), _) if m == all => return Some(b),
+                    (Bin::Or, _, Some(m)) if m == all => return Some(b),
+                    (Bin::Or, Some(m), _) if m == all => return Some(a),
+                    (Bin::And | Bin::Or, _, _) if a == b => return Some(a),
+                    _ => {}
                 }
+                match op {
+                    Bin::Xor => {
+                        for (cand, other) in [(a, b), (b, a)] {
+                            if let V::Inst(j) = cand
+                                && let Op::Bin(Bin::Xor, x, y) = self.insts[j as usize].op
+                            {
+                                if other == y {
+                                    return Some(x);
+                                }
+                                if other == x {
+                                    return Some(y);
+                                }
+                            }
+                        }
+                    }
+                    Bin::And => {
+                        if let Some((v, m)) = kb.map(|m| (a, m)).or_else(|| ka.map(|m| (b, m)))
+                            && let V::Inst(j) = v
+                        {
+                            match self.insts[j as usize].op {
+                                Op::Bin(Bin::LShr, _, sh) => {
+                                    if let Some((_, s)) = self.int_k(sh).filter(|&(_, s)| s < u64::from(bits)) {
+                                        let known = all >> s;
+                                        if known & m == known {
+                                            return Some(v);
+                                        }
+                                        if known & m == 0 {
+                                            return Some(self.k(ty, bits, 0));
+                                        }
+                                    }
+                                }
+                                Op::Bin(Bin::Shl, _, sh) => {
+                                    if let Some((_, s)) = self.int_k(sh).filter(|&(_, s)| s < u64::from(bits)) {
+                                        let known = (all << s) & all;
+                                        if known & m == known {
+                                            return Some(v);
+                                        }
+                                        if known & m == 0 {
+                                            return Some(self.k(ty, bits, 0));
+                                        }
+                                    }
+                                }
+                                Op::Bin(Bin::And, x, y) => {
+                                    if let Some(c1) =
+                                        self.int_k(y).or_else(|| self.int_k(x)).map(|k| k.1)
+                                    {
+                                        if c1 & m == c1 {
+                                            return Some(v);
+                                        }
+                                        if c1 & m == 0 {
+                                            return Some(self.k(ty, bits, 0));
+                                        }
+                                    }
+                                }
+                                Op::Cast(Cast::ZExt, inner)
+                                    if self.int_bits(self.type_of(inner)) == Some(1) =>
+                                {
+                                    return Some(if m & 1 != 0 { v } else { self.k(ty, bits, 0) });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Bin::Or => {
+                        if let Some((v, m)) = kb.map(|m| (a, m)).or_else(|| ka.map(|m| (b, m)))
+                            && let V::Inst(j) = v
+                            && let Op::Bin(Bin::Or, x, y) = self.insts[j as usize].op
+                            && let Some(c1) = self.int_k(y).or_else(|| self.int_k(x)).map(|k| k.1)
+                        {
+                            if c1 | m == c1 {
+                                return Some(v);
+                            }
+                            if (c1 | m) == all {
+                                return Some(self.k(ty, bits, all));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                None
             }
             Op::Cmp(p, a, b) if p <= pred::TRUE => {
                 // Two float constants compare one way (`v_mul_legacy` asks
@@ -599,6 +688,20 @@ impl Module {
                     }
                     _ => None,
                 }
+            }
+            Op::Call(f, ref args) => {
+                // Fold `Countbits` (dx.op.unaryBits.i32, opcode 31) of a constant:
+                // AMD's driver (amdxc64, RDNA4) folds `Bfrev(Countbits(K))` to
+                // `Bfrev(n) | n` (0x80000001 for K = 2).
+                if self.funcs[f as usize].name == "dx.op.unaryBits.i32"
+                    && args.len() == 2
+                    && self.int_k(args[0]).is_some_and(|k| k.1 == 31)
+                    && let Some((bits, x)) = self.int_k(args[1])
+                {
+                    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                    return Some(self.k(ty, 32, ((x & mask).count_ones()) as u64));
+                }
+                None
             }
             _ => None,
         }
@@ -949,6 +1052,22 @@ impl Module {
             for_each_operand(&self.insts[i as usize].op, |v| {
                 mark(&mut live, &mut work, v)
             });
+        }
+        // Diagnostics (`VICTORY_SHADER_OPT_TRACE=1`): the calls that leave,
+        // by function, on the error output.
+        if std::env::var_os("VICTORY_SHADER_OPT_TRACE").is_some() {
+            let mut gone: std::collections::BTreeMap<String, u32> = Default::default();
+            for (b, blk) in self.blocks.iter().enumerate() {
+                for &i in blk.body.iter().filter(|&&i| !reached[b] || !live[i as usize]) {
+                    let what = match &self.insts[i as usize].op {
+                        Op::Call(f, _) => self.funcs[*f as usize].name.clone(),
+                        Op::Load(_) => "load".into(),
+                        _ => continue,
+                    };
+                    *gone.entry(what).or_default() += 1;
+                }
+            }
+            eprintln!("clean-up: calls dropped as dead: {gone:?}");
         }
         for (b, blk) in self.blocks.iter_mut().enumerate() {
             if reached[b] {
@@ -2132,5 +2251,77 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    #[test]
+    fn fold_simplifies_bitmasks_double_xor_and_zext_masks() {
+        let Kit {
+            mut m,
+            b: entry,
+            pure,
+            writes: sink,
+            ..
+        } = kit();
+        let i32t = m.int(32);
+        let (c0, c2, c24) = (m.i32(0), m.i32(2), m.i32(24));
+        let x = m.call(entry, pure, vec![c0, c2]);
+        let (all, mff, mhi, mlo) = (
+            m.i32(u32::MAX),
+            m.i32(0xFF),
+            m.i32(0xFFFF_0000),
+            m.i32(0x0000_FFFF),
+        );
+        let (align4, low2, k) = (m.i32(!3u32), m.i32(3), m.i32(0xA5A5_5A5A));
+
+        let or_all = m.bin(entry, Bin::Or, x, all);
+        let x1 = m.bin(entry, Bin::Xor, x, k);
+        let x2 = m.bin(entry, Bin::Xor, x1, k);
+        let shr = m.bin(entry, Bin::LShr, x, c24);
+        let shr_keep = m.bin(entry, Bin::And, shr, mff);
+        let shr_zero = m.bin(entry, Bin::And, shr, mhi);
+        let shl = m.bin(entry, Bin::Shl, x, c2);
+        let shl_keep = m.bin(entry, Bin::And, shl, align4);
+        let shl_zero = m.bin(entry, Bin::And, shl, low2);
+        let a1 = m.bin(entry, Bin::And, x, mff);
+        let a_keep = m.bin(entry, Bin::And, a1, mlo);
+        let a_zero = m.bin(entry, Bin::And, a1, mhi);
+        let o1 = m.bin(entry, Bin::Or, x, mlo);
+        let o_keep = m.bin(entry, Bin::Or, o1, mff);
+        let o_all = m.bin(entry, Bin::Or, o1, mhi);
+        let cond = m.cmp(entry, pred::EQ, x, c0);
+        let z = m.cast(entry, Cast::ZExt, cond, i32t);
+        let z_keep = m.bin(entry, Bin::And, z, mff);
+        let z_zero = m.bin(entry, Bin::And, z, mhi);
+
+        for v in [
+            or_all, x2, shr_keep, shr_zero, shl_keep, shl_zero, a_keep, a_zero, o_keep, o_all,
+            z_keep, z_zero,
+        ] {
+            m.call(entry, sink, vec![c0, v]);
+        }
+        m.terminate(entry, Term::Ret);
+        m.optimise(FOLD | DEAD);
+
+        let args: Vec<V> = m.blocks[entry]
+            .body
+            .iter()
+            .filter_map(|&i| match &m.insts[i as usize].op {
+                Op::Call(fn_id, a) if m.funcs[*fn_id as usize].name.contains("Store") => Some(a[1]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args.len(), 12);
+        assert_eq!(m.int_k(args[0]).map(|k| k.1), Some(u64::from(u32::MAX)));
+        assert_eq!(args[1], x);
+        assert_eq!(args[2], shr);
+        assert_eq!(m.int_k(args[3]).map(|k| k.1), Some(0));
+        assert_eq!(args[4], shl);
+        assert_eq!(m.int_k(args[5]).map(|k| k.1), Some(0));
+        assert_eq!(args[6], a1);
+        assert_eq!(m.int_k(args[7]).map(|k| k.1), Some(0));
+        assert_eq!(args[8], o1);
+        assert_eq!(m.int_k(args[9]).map(|k| k.1), Some(u64::from(u32::MAX)));
+        assert_eq!(args[10], z);
+        assert_eq!(m.int_k(args[11]).map(|k| k.1), Some(0));
     }
 }

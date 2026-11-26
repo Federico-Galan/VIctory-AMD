@@ -353,6 +353,15 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// All the view it records is made from: records with equal keys have
+    /// equal views (of the same host texture).
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -927,11 +936,19 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
+/// `CreateConstantBufferView` with a null description. Leaving the slot
+/// untouched would keep a stale view active.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            View::Constant(address, size)
+        }
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.

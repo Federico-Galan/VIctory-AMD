@@ -336,6 +336,10 @@ pub(crate) fn window_line(frames: f64) {
     );
 }
 
+/// What a render target or depth view of the host is made from: the host
+/// texture, and [`crate::descriptor::RtvRecord::key`].
+type TargetKey = (usize, (usize, [u32; 7]));
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -361,6 +365,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// The render target views and the depth view the host list has, once
+    /// it has any ([`State::set_targets`]): per view the host texture (0:
+    /// a null view) and what its descriptor says.
+    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -830,7 +838,11 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Render targets and depth, set on the host list at once, unless it has
+    /// the same ones already: the title sets the same targets again and
+    /// again, each time a host view per target and a call of the driver
+    /// (25,662 times in a frame of another fork). `VICTORY_BIND_CACHE=0`
+    /// sets them every time.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let Some(host) = crate::host::host() else {
             return;
@@ -840,7 +852,8 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut views = Vec::with_capacity(handles.len());
+        let mut keys = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -860,14 +873,16 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    views.push((None, Some(desc)));
+                    keys.push((0, record.key()));
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            views.push((Some(texture), record.desc()));
+            keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -880,8 +895,25 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((texture, record))
         });
+        let now = (
+            keys,
+            dsv.as_ref()
+                .map(|(texture, record)| (texture.as_raw() as usize, record.key())),
+        );
+        static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
+            && self.host_targets.as_ref() == Some(&now)
+        {
+            return;
+        }
+        self.host_targets = Some(now);
+        let rtvs: Vec<_> = views
+            .iter()
+            .map(|(texture, desc)| host.rtv(*texture, desc.as_ref()))
+            .collect();
+        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -951,6 +983,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.host_targets = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1090,7 +1123,7 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -2287,15 +2320,33 @@ impl State {
         crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
     }
 
+    /// What is about to be recorded may write arguments (`stores`: a
+    /// dispatch, or shaders that can store to buffers): the list's
+    /// gathering ends, whole, or with `crate::indirect::gather_by_copy`
+    /// only for the copies the shaders are declared to write as they are
+    /// prepared (`HostList::gather_wrote`), and whole only for a pipeline
+    /// the layer does not know.
+    fn gather_ends(&self, list: &HostList, stores: bool) {
+        if !stores {
+            return;
+        }
+        if !crate::indirect::gather_by_copy() || crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+            list.gather_close();
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
-        list.gather_close();
-        #[cfg(feature = "diagnostics")]
+        self.gather_ends(list, true);
+        #[cfg(windows)]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::pipeline::note_drop(self.pipeline as This);
+            #[cfg(feature = "diagnostics")]
+            {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                crate::pipeline::note_drop(self.pipeline as This);
+            }
             return;
         }
         // A program that walks ray-tracing structures nothing has built.
@@ -2607,9 +2658,7 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
-        if self.may_store() {
-            list.gather_close();
-        }
+        self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3070,9 +3119,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
-        if self.may_store() {
-            list.gather_close();
-        }
+        self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3178,9 +3225,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
-        if self.may_store() {
-            list.gather_close();
-        }
+        self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3223,8 +3268,9 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
@@ -3327,7 +3373,7 @@ impl State {
         if !windowed {
             // A dispatch, or shaders that store to buffers: arguments may
             // be written from here on.
-            list.gather_close();
+            self.gather_ends(list, true);
         }
         // Diagnostics: why this command gets a pass of ours, if it does.
         #[cfg(feature = "diagnostics")]
@@ -3698,6 +3744,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Some compute-written textures are also read by the title CPU.
+            list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

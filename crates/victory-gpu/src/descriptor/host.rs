@@ -127,6 +127,22 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
 /// them ([`HostHeap::texture_views_remade`]).
 static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
+/// Since the start, of [`HostHeap::texture_views_remade`]: view slots made
+/// again, those of them made while a submission was in flight, and passes
+/// put off because one was (`VICTORY_VIEWS_REMADE_QUIET=1`).
+static VIEWS_REMADE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether view slots of textures with levels on demand are made again
+/// only while no submission is in flight (`VICTORY_VIEWS_REMADE_QUIET=1`;
+/// off by default: at every texture pass, as before). A texture then
+/// shows its new level a pass or more later. After fork pull request
+/// #1219, whose author lost the device with slots rewritten under lists
+/// already sent; whether that is behind the losses here is not known.
+fn views_remade_quiet() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEWS_REMADE_QUIET").is_some_and(|v| v == "1"))
+}
+
 /// The first level with memory of the placed texture at `start` changed:
 /// its slots are made again at the next texture pass.
 pub(crate) fn levels_changed(start: u64) {
@@ -1397,7 +1413,22 @@ impl HostHeap {
     const WAITING_A_PASS: usize = 128;
 
     pub(crate) fn texture_views_remade(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         if self.sampler {
+            return 0;
+        }
+        // The slots made again here are live slots of the heap the card
+        // reads, and the making is the layer's own, at a moment the title
+        // knows nothing of: a list already sent may be reading a slot while
+        // it is written (Direct3D 12 asks that a descriptor a submitted
+        // list reads is left alone until the list has run). Counted always;
+        // with `VICTORY_VIEWS_REMADE_QUIET=1` the pass is put off while a
+        // submission is in flight, and what is due stays due.
+        let flying = crate::host::submissions_in_flight();
+        if flying > 0 && views_remade_quiet() {
+            if !RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                VIEWS_REMADE[2].fetch_add(1, Relaxed);
+            }
             return 0;
         }
         let starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1424,6 +1455,21 @@ impl HostHeap {
                 self.keep(slot, kept);
                 remade += 1;
             }
+        }
+        let before = VIEWS_REMADE[0].fetch_add(remade as u64, Relaxed);
+        if flying > 0 {
+            VIEWS_REMADE[1].fetch_add(remade as u64, Relaxed);
+        }
+        // Said at every 1,024 slots made again.
+        if (before + remade as u64) / 1024 != before / 1024 {
+            tracing::info!(
+                "view slots of textures with levels on demand made again, since the start: {}, {} of them while a submission was in flight \
+                 (a list already sent may have been reading the slot); {} passes put off for that (VICTORY_VIEWS_REMADE_QUIET=1: {})",
+                before + remade as u64,
+                VIEWS_REMADE[1].load(Relaxed),
+                VIEWS_REMADE[2].load(Relaxed),
+                if views_remade_quiet() { "on" } else { "off" }
+            );
         }
         remade
     }
@@ -1803,7 +1849,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: constant_view_size(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -2594,6 +2640,33 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Whether the host stores to typed unordered views of `format`.
+fn typed_store(format: u32) -> bool {
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let ok = host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    known.push((format, ok));
+    ok
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -2635,8 +2708,18 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // A typed unordered view in a format the host cannot store to
+    // (B5G5R5A1_UNORM on NVIDIA) removes the device when made, in the
+    // texture's own format too: the slot stays null, its writes dropped.
+    // The format checked is the one the view is made in: a typed
+    // texture's own unless the requested one is castable (below).
+    let typed = if view == 0 || !typeless { own } else { view };
+    if unordered && !(view == 0 && typeless) && !typed_store(typed) {
+        once!(view = typed, own, "an unordered view in a format the host cannot store");
+        return false;
+    }
     if view == 0 {
-        return !typeless;
+        return !typeless && (!unordered || typed_store(own));
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
@@ -2725,6 +2808,25 @@ fn twin_uav(
     Some(desc)
 }
 
+/// The size of a constant buffer view the host takes: 256-byte steps, and
+/// at most 4,096 vectors (65,536 bytes, `D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT`).
+/// The title names constant views of more (one of 1,306,368 bytes, in the
+/// world); `CreateConstantBufferView` with such a size is an invalid call,
+/// and NVIDIA removes the device for it (`DXGI_ERROR_INVALID_CALL`), in
+/// the frame the view is made. A shader reads at most 4,096 vectors through
+/// a constant view, so nothing it can read is lost.
+fn constant_view_size(size: u32) -> u32 {
+    const MOST: u32 = 4096 * 16;
+    // The cap before the rounding (fork pull request #1206): a size within
+    // 255 of the largest number would round past it, to 0 in a release
+    // build, and a view of no bytes be made with no line said.
+    if size > MOST {
+        once!(size, "a constant buffer view over 64 KiB, made 64 KiB (the host takes no more)");
+        return MOST;
+    }
+    size.max(1).next_multiple_of(256)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -2743,7 +2845,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: constant_view_size(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -3135,6 +3237,19 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A constant view is made in 256-byte steps and at most 64 KiB, the
+    /// most the host takes (a larger size removes the device on NVIDIA).
+    #[test]
+    fn constant_views_are_at_most_64_kib() {
+        assert_eq!(constant_view_size(16), 256);
+        assert_eq!(constant_view_size(256), 256);
+        assert_eq!(constant_view_size(65_536), 65_536);
+        assert_eq!(constant_view_size(1_306_368), 65_536);
+        assert_eq!(constant_view_size(65_537), 65_536);
+        assert_eq!(constant_view_size(u32::MAX), 65_536);
+        assert_eq!(constant_view_size(u32::MAX - 100), 65_536);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

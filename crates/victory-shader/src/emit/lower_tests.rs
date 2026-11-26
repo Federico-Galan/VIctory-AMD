@@ -643,3 +643,82 @@ fn small_floats_widen_as_halves() {
     assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
 }
 
+#[test]
+fn bfrev_lowers_with_shifts_and_masks_instead_of_dxil_bfrev() {
+    let words = [
+        0xBE82_0B00u32, // s_brev_b32 s2, s0
+        0x7E02_7100,    // v_bfrev_b32 v1, v0
+        0x7E04_0202,    // v_mov_b32 v2, s2
+        0x4A02_0501,    // v_add_nc_u32 v1, v1, v2
+        0xD834_0000,
+        0x0000_0100,    // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let emitted = lower_with(&words, vec![root(RootType::Constants, 0, 1)], vec![]).unwrap();
+    assert!(
+        !emitted.dxil.windows(b"dx.op.unary.i32".len()).any(|w| w == b"dx.op.unary.i32"),
+        "bfrev should lower to shifts and masks instead of dx.op.unary.i32"
+    );
+}
+
+#[test]
+fn v_cmp_class_f32_const_mask_avoids_cascade() {
+    let lower_cs = |words: &[u32]| {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![root(RootType::Constants, 0, 1)],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (1 << 15) | (1 << 1),
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap()
+    };
+    // v_cmp_class_f32_e64 vcc, v0, 0x207 (NaN | +Inf | -Inf) followed by v_cndmask_b32_e32 v1, 0, v0
+    let words = [
+        0xD488_006Au32,
+        0x0001_FF00,
+        0x0000_0207, // literal constant mask (NaN | +-Inf)
+        0x0202_0080, // v_cndmask_b32_e32 v1, 0, v0 (reads vcc)
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let emitted = lower_cs(&words);
+    let dyn_words = [
+        0xD488_006Au32,
+        0x0000_0100, // v_cmp_class_f32_e64 vcc, v0, s0 (dynamic mask)
+        0x0202_0080,
+        0xD834_0000,
+        0x0000_0100,
+        S_ENDPGM,
+    ];
+    let dyn_emitted = lower_cs(&dyn_words);
+    assert!(
+        emitted.dxil.len() < dyn_emitted.dxil.len(),
+        "const-mask fclass ({} B) should be smaller than dynamic cascade ({} B)",
+        emitted.dxil.len(),
+        dyn_emitted.dxil.len()
+    );
+}
+
