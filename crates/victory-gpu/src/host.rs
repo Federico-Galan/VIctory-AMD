@@ -2110,6 +2110,8 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Last GPU source copied into each aliased host texture in this list.
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -3825,6 +3827,14 @@ fn late_line(frames: f64) {
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
+        );
+    }
+    {
+        let found = [0, 1].map(|i| crate::shadow::LOOKUPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "asks for a buffer's host copy per frame: {:.0} answered from the asking thread's memory of them, {:.0} from the tables (VICTORY_LOOKUP_CACHE)",
+            found[0],
+            found[1]
         );
     }
 }
@@ -7365,6 +7375,12 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.

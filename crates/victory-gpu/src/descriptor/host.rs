@@ -1847,9 +1847,13 @@ impl HostHeap {
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: constant_view_size(size),
+        let desc = if size == 0 {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
+        } else {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                BufferLocation: gpu,
+                SizeInBytes: constant_view_size(size),
+            }
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -2158,6 +2162,26 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
         std::ptr::from_ref(&words)
             .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
             .read_unaligned()
+    }
+}
+
+/// Typed buffer views of 32-bit integer formats (`R32_UINT`, `R32G32_UINT`,
+/// etc.) are made in the float format of the same width: Direct3D 12
+/// converts between float and integer values on the way: a store of an
+/// integer's bits as a float is written as the integer the float rounds to
+/// (zero for most of them), where the console moves the bits. The float
+/// format of the same width moves them unchanged, and matches what the
+/// shader declares. (The meshlet culling programs append packed meshlet
+/// numbers to an `R32_UINT` list this way.)
+fn bit_exact_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    match format {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT => {
+            DXGI_FORMAT_R32G32B32A32_FLOAT
+        }
+        DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT => DXGI_FORMAT_R32_FLOAT,
+        other => other,
     }
 }
 
@@ -2497,6 +2521,7 @@ fn buffer_srv(
             Flags: D3D12_BUFFER_SRV_FLAG_RAW,
         };
     }
+    desc.Format = bit_exact_format(desc.Format);
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -2611,6 +2636,7 @@ fn buffer_uav(
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    desc.Format = bit_exact_format(desc.Format);
     if window.is_some() {
         // (Left out at first: every structured unordered access view was then
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
@@ -2824,7 +2850,11 @@ fn constant_view_size(size: u32) -> u32 {
         once!(size, "a constant buffer view over 64 KiB, made 64 KiB (the host takes no more)");
         return MOST;
     }
-    size.max(1).next_multiple_of(256)
+    // A view of no bytes stays one: a shader reads zeros through it, as on the
+    // console. Rounded up from 1 it became 256 bytes of whatever lies at its
+    // address in the host copy (the ring of per-draw constants among it), other
+    // bytes every frame: a floor in the first rooms flickered.
+    size.next_multiple_of(256)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -2834,6 +2864,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if size == 0 {
+                let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                // SAFETY: a slot of our heap; a zero location makes a null view.
+                unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+                return Some(None);
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -3242,6 +3278,8 @@ mod tests {
     /// most the host takes (a larger size removes the device on NVIDIA).
     #[test]
     fn constant_views_are_at_most_64_kib() {
+        assert_eq!(constant_view_size(0), 0);
+        assert_eq!(constant_view_size(1), 256);
         assert_eq!(constant_view_size(16), 256);
         assert_eq!(constant_view_size(256), 256);
         assert_eq!(constant_view_size(65_536), 65_536);
@@ -3249,6 +3287,35 @@ mod tests {
         assert_eq!(constant_view_size(65_537), 65_536);
         assert_eq!(constant_view_size(u32::MAX), 65_536);
         assert_eq!(constant_view_size(u32::MAX - 100), 65_536);
+    }
+
+    /// Typed buffer views of 32-bit integer formats are made in the float
+    /// format of the same width (the shaders' float loads and stores then
+    /// move the bits); every other format is the title's.
+    #[test]
+    fn typed_buffer_views_of_32_bit_integers_move_bits() {
+        for (title, host) in [
+            (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_FLOAT),
+            (DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_FLOAT),
+            (DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT),
+        ] {
+            assert_eq!(bit_exact_format(title), host);
+            assert_eq!(
+                crate::resource::element(title.0 as u32),
+                crate::resource::element(host.0 as u32)
+            );
+        }
+        for kept in [
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_R16G16_UINT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ] {
+            assert_eq!(bit_exact_format(kept), kept);
+        }
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
