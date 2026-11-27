@@ -75,6 +75,7 @@ fn build() -> [u8; 32] {
             "SCARLETT_MESH_OUTPUT_STRICT",
             "SCARLETT_BVH_FENCES",
             "SCARLETT_BVH_BOUNDS",
+            "SCARLETT_SHADER_FAST_BITS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

@@ -73,8 +73,15 @@ pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | GUARDS;
 pub const ALL: u32 = MODULE | FIRST | WIDE;
 /// The passes that run when nothing says which: every one but [`WIDE`],
 /// which no card has shown a gain for yet (`SCARLETT_SHADER_OPT=127` asks
-/// for it), and [`GUARDS`], not measured on a card yet.
+/// for it), and [`GUARDS`], not measured on a card yet; [`FAST`] (256)
+/// stays opt-in (`SCARLETT_SHADER_OPT=511` or `319`) because fast-math
+/// alters compute/world-load behavior on RDNA 4 without bit-level NaN guards.
 pub const DEFAULT: u32 = ALL & !WIDE & !GUARDS;
+/// Not a pass either: the 32-bit float binary operations are written with
+/// LLVM's fast-math flags (`SCARLETT_SHADER_FAST_BITS`, default `24`), so
+/// the driver may optimize reciprocal / signed zeros while keeping NaN and
+/// infinity checks. Outside [`ALL`] (`255`), so `255` stays "every pass".
+pub const FAST: u32 = 256;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
