@@ -289,6 +289,55 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// The list's shader write mark when it was clamped
+    /// (`HostList::shader_write_mark`, [`in_order`]).
+    opened: u64,
+}
+
+/// Whether an indirect execution whose arguments shaders of its list were
+/// declared to write after the open batch or window was clamped, or whose
+/// arguments or count the card reads in place, is clamped alone, right
+/// before it runs (`SCARLETT_INDIRECT_ORDER`, on by default; `=0`: from the
+/// batch or window as any other). The idea is avatarmanz's
+/// (`VIctory-7900XTX`, 631400f5 and 15c3d0ea), for his renderer's memory
+/// read in place; here the writes are the ones declared on host copies too.
+///
+/// A batch or a window clamps records ahead: in the pass recorded where it
+/// was opened, before the commands between it and the execution that reads
+/// them. A window is not ended by dispatches, and a batch only by what is
+/// known to store to buffers, so records the title's culling writes in
+/// between were read before they were written: the execution drew an
+/// earlier frame's records, or none, and trees and far objects went for a
+/// moment and came back (issue 96). Memory read in place is not declared
+/// written at all, so its executions are always clamped alone.
+fn in_order() -> bool {
+    crate::toggled!("SCARLETT_INDIRECT_ORDER")
+}
+
+/// Indirect executions clamped alone for [`in_order`] since the start.
+pub(crate) static IN_ORDER_ALONE: AtomicU64 = AtomicU64::new(0);
+
+/// Indirect executions since the start, and of them those whose arguments
+/// shaders of their list were declared to write ([`in_order_note`]).
+static IN_ORDER_SEEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Counts an indirect execution for [`in_order`], and every 16,384th logs
+/// how many there were, how many read arguments their list's shaders wrote,
+/// and how many were clamped alone.
+fn in_order_note(alone: bool, written: impl FnOnce() -> bool) {
+    let all = IN_ORDER_SEEN[0].fetch_add(1, Ordering::Relaxed) + 1;
+    if alone || written() {
+        IN_ORDER_SEEN[1].fetch_add(1, Ordering::Relaxed);
+    }
+    if all.is_multiple_of(16_384) {
+        tracing::info!(
+            target: "victory_gpu::ab",
+            "indirect executions so far: {all}, {} reading arguments shaders of their list wrote, {} clamped              alone as written after their batch or window (SCARLETT_INDIRECT_ORDER {})",
+            IN_ORDER_SEEN[1].load(Ordering::Relaxed),
+            IN_ORDER_ALONE.load(Ordering::Relaxed),
+            if in_order() { "on" } else { "off" }
+        );
+    }
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -384,6 +433,8 @@ struct Batch {
     /// Dispatches since, which may have written arguments
     /// (`SCARLETT_INDIRECT_BATCH=2`).
     wrote: bool,
+    /// The list's shader write mark when it was opened ([`in_order`]).
+    opened: u64,
 }
 
 /// The host copies arguments were read from last: what a batch opens with,
@@ -456,6 +507,10 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
+    /// The host heaps (view, sampler) the list has while `host_heaps_set`:
+    /// another title heap that comes to the same host heaps leaves the list
+    /// as it is ([`same_host_heaps`]).
+    host_heap_objs: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1592,22 +1647,33 @@ impl State {
             if sampler_heap.is_none() {
                 sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
             }
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
-            if let Some(h) = view_heap {
-                list.keep(&h);
-                heaps.push(Some(h));
-            }
-            if let Some(h) = sampler_heap {
-                list.keep(&h);
-                heaps.push(Some(h));
-            }
-            if !heaps.is_empty() {
-                // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps) };
+            let objs = [
+                view_heap.as_ref().map_or(0, |h| h.as_raw() as usize),
+                sampler_heap.as_ref().map_or(0, |h| h.as_raw() as usize),
+            ];
+            // Title heaps that come to the host heaps the list already has
+            // (a title heap without a host one, the fallbacks): setting them
+            // again would only clear the root signature and its bindings,
+            // which every draw sets again.
+            if !(self.host_heaps_set && same_host_heaps() && objs == self.host_heap_objs) {
+                let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
+                if let Some(h) = view_heap {
+                    list.keep(&h);
+                    heaps.push(Some(h));
+                }
+                if let Some(h) = sampler_heap {
+                    list.keep(&h);
+                    heaps.push(Some(h));
+                }
+                if !heaps.is_empty() {
+                    // SAFETY: an open list and shader-visible heaps.
+                    unsafe { l.SetDescriptorHeaps(&heaps) };
+                }
+                self.host_heap_objs = objs;
+                self.host_roots = [0; 2];
             }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;
-            self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
@@ -4186,11 +4252,12 @@ impl State {
             return Some((b.scratch.clone(), at));
         }
         self.batch = None;
+        let opened = list.shader_write_mark();
         let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let at = table.place(id, offset, kind)?;
-        self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+        self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false, opened });
         Some((scratch, at))
     }
 
@@ -4285,8 +4352,23 @@ impl State {
             why("mesh draws are switched off (SCARLETT_MESH_TEST=skip)");
             return false;
         }
+        // Arguments written since the open batch or window was clamped, or
+        // read in place: clamped alone, right before they run (`in_order`).
+        let alone = in_order() && {
+            let since = |opened: u64| list.shader_written_since(arguments, len, opened);
+            args.in_place()
+                || counter.as_ref().is_some_and(|(s, _)| s.in_place())
+                || self.batch.as_ref().is_some_and(|b| since(b.opened))
+                || self.window.as_ref().is_some_and(|w| since(w.opened))
+        };
+        if alone {
+            self.batch = None;
+            self.window = None;
+            IN_ORDER_ALONE.fetch_add(1, Ordering::Relaxed);
+        }
+        in_order_note(alone, || list.shader_written_since(arguments, len, 0));
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -4302,6 +4384,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
+            && !alone
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -4352,6 +4435,7 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
+                let opened = list.shader_write_mark();
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
@@ -4372,6 +4456,7 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    opened,
                 });
                 (bounded, 0)
             }
@@ -4893,6 +4978,15 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
     }
+}
+
+/// Whether a change of title heaps that leaves the host heaps as they are
+/// skips `SetDescriptorHeaps` and the root signature's reset (on by
+/// default; `SCARLETT_SAME_HOST_HEAPS=0`: set again on every change, as
+/// before).
+fn same_host_heaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SCARLETT_SAME_HOST_HEAPS").map_or(true, |v| v.trim() != "0"))
 }
 
 /// Per-frame texture staging byte budget scaled from the adapter's local VRAM
