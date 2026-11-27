@@ -853,7 +853,19 @@ fn stream_pipeline<S>(
     stream: &mut S,
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    stream_pipeline_as(device, stream, name, false)
+}
+
+/// [`stream_pipeline`], with `mesh` saying the stream is a mesh pipeline's
+/// (made one at a time on AMD cards: [`super::library::mesh_one_at_a_time`]).
+fn stream_pipeline_as<S>(
+    device: &ID3D12Device,
+    stream: &mut S,
+    name: &str,
+    mesh: bool,
+) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
+    let one_at_a_time = mesh && super::library::mesh_one_at_a_time(device);
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: size_of::<S>(),
         pPipelineStateSubobjectStream: std::ptr::from_mut(stream).cast(),
@@ -864,7 +876,7 @@ fn stream_pipeline<S>(
         // SAFETY: the stream holds whole subobjects pointing at live data.
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
         // SAFETY: as above.
-        || unsafe { device.CreatePipelineState(&desc) },
+        || super::library::made_alone(one_at_a_time, || unsafe { device.CreatePipelineState(&desc) }),
     )
 }
 
@@ -983,7 +995,7 @@ fn mesh_pipeline(
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             ),
         };
-        stream_pipeline(device, &mut stream, name)
+        stream_pipeline_as(device, &mut stream, name, true)
     };
     if depth_bounds {
         let mut stream = Stream {
@@ -1002,7 +1014,7 @@ fn mesh_pipeline(
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             ),
         };
-        stream_pipeline(device, &mut stream, name)
+        stream_pipeline_as(device, &mut stream, name, true)
     } else {
         build(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth))
     }

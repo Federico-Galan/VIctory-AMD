@@ -150,19 +150,30 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    vram_keep_for(budget, used, crate::resource::room_percent())
+}
+
+fn vram_keep_for(budget: u64, used: u64, room_percent: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
-    let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
-        (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    let (high, target, short) = if room_percent > 90 {
+        let high = room_percent;
+        let target = room_percent.saturating_sub(2).max(85);
+        (high, target, room_percent.saturating_add(2).min(97))
     } else {
-        (SHORT_MS, used - share(85))
+        (88, 85, 95)
+    };
+    let share = |percent: u64| budget / 100 * percent;
+    if used < share(high) {
+        (KEPT_MS, u64::MAX)
+    } else if used < share(short) {
+        (IDLE_MS, used - share(target))
+    } else {
+        (SHORT_MS, used - share(target))
     }
 }
 
@@ -443,6 +454,7 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+        crate::shadow::trim_snapshot_pool();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -941,6 +953,14 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        // RDNA 4 (Navi 48: RX 9070, 9070 XT, Radeon AI PRO R9700; Navi 44:
+        // RX 9060 XT) are AMD's device ids 0x7550-0x75ff; RDNA 3 lies below
+        // (0x744c: RX 7900 XTX). Its shader compiler faults on a raw view's
+        // size asked through the handle of a load (ported from
+        // avatarmanz/VIctory-7900XTX#357, GPL-3.0).
+        let rdna4 = crate::indirect::rdna4(&device);
+        victory_shader::emit::set_host_rdna4(rdna4);
+        tracing::info!(rdna4, "host RDNA 4 check");
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -8651,13 +8671,16 @@ impl Host {
         }
     }
 
-    pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        MADE[0].fetch_add(1, Ordering::Relaxed);
-        MADE[1].fetch_add(size, Ordering::Relaxed);
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
-            ..Default::default()
-        };
+    fn mapped_buffer_on_heap(
+        &self,
+        size: u64,
+        heap: D3D12_HEAP_PROPERTIES,
+        state: D3D12_RESOURCE_STATES,
+        flags: D3D12_RESOURCE_FLAGS,
+        wait_mapped: bool,
+        diag_label: &'static str,
+        warn_label: &'static str,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -8669,41 +8692,66 @@ impl Host {
                 Quality: 0,
             },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    not_resident(),
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    b.Map(0, None, Some(&mut data))
-                })
+        let try_create = || -> windows::core::Result<(ID3D12Resource, *mut u8)> {
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of a CPU-visible buffer.
+            unsafe {
+                self.device
+                    .CreateCommittedResource(&heap, not_resident(), &desc, state, None, &mut buffer)?;
+                let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                resident(&self.device, b)?;
+                if wait_mapped {
+                    mapped(&self.device)?;
+                }
+                b.Map(0, None, Some(&mut data))?;
+            }
+            Ok((buffer.ok_or_else(windows::core::Error::empty)?, data.cast()))
         };
-        #[cfg(feature = "diagnostics")]
-        if made.is_ok()
-            && let Some(b) = &buffer
-        {
-            crate::book::made(b, || "an upload buffer".into());
-        }
+        let made = match try_create() {
+            Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY => {
+                crate::residency::allocation_error(&e);
+                crate::shadow::trim_snapshot_pool();
+                crate::pool::reclaim_staging_urgent();
+                try_create()
+            }
+            other => other,
+        };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok((buffer, data)) => {
+                #[cfg(feature = "diagnostics")]
+                crate::book::made(&buffer, || diag_label.into());
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = diag_label;
+                Some((buffer, data))
+            }
             Err(e) => {
                 crate::residency::allocation_error(&e);
-                tracing::warn!(error = %e, size, "no upload buffer");
+                tracing::warn!(error = %e, size, "{warn_label}");
                 None
             }
         }
+    }
+
+    pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        MADE[0].fetch_add(1, Ordering::Relaxed);
+        MADE[1].fetch_add(size, Ordering::Relaxed);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_UPLOAD,
+            ..Default::default()
+        };
+        self.mapped_buffer_on_heap(
+            size,
+            heap,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            D3D12_RESOURCE_FLAG_NONE,
+            false,
+            "an upload buffer",
+            "no upload buffer",
+        )
     }
 }
 
@@ -9548,53 +9596,15 @@ impl Host {
             MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
             ..Default::default()
         };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            ..Default::default()
-        };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    not_resident(),
-                    &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
-        #[cfg(feature = "diagnostics")]
-        if made.is_ok()
-            && let Some(b) = &buffer
-        {
-            crate::book::made(b, || "a shared buffer".into());
-        }
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
-                None
-            }
-        }
+        self.mapped_buffer_on_heap(
+            size,
+            heap,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            true,
+            "a shared buffer",
+            "no shared buffer",
+        )
     }
 
     /// Whether buffers can lie in the card's memory and be mapped by the CPU
@@ -10758,7 +10768,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
+        use super::{vram_keep, vram_keep_for};
         let gib = 1 << 30;
         assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
         // Past it: the longest idle ones, enough to come down to 85 %.
@@ -10766,6 +10776,10 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+        // Higher configured room percent (e.g. 93%) raises the keep band without churn.
+        assert_eq!(vram_keep_for(100 * gib, 92 * gib, 93).0, 600_000);
+        assert_eq!(vram_keep_for(100 * gib, 94 * gib, 93), (5_000, 3 * gib));
+        assert_eq!(vram_keep_for(100 * gib, 96 * gib, 93), (1_500, 5 * gib));
     }
 
     #[test]

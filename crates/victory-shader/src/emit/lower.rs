@@ -1122,11 +1122,24 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+/// wave, the view heap's limit, where the raw twins of its views start,
+/// what it writes for the console's own hardware, and whether a raw view's
+/// size is asked through a handle of its own.
+pub fn host_settings() -> [u32; 5] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        u32::from(lower_ops::raw_size_own_handle()),
+    ]
 }
+
+pub use lower_ops::set_host_rdna4;
+#[cfg(test)]
+pub(super) use lower_ops::TEST_RAW_SIZE;
+#[cfg(test)]
+use lower_ops::raw_size_asked;
 
 /// The spin-wait cut of fx-shaderperf (`SCARLETT_SPIN_LIMIT`) is not taken on
 /// this branch (approximate: a wait cut short reads tiles before they are
@@ -6560,7 +6573,6 @@ impl<'a> Lower<'a> {
         };
         let src = Source::Loaded { load: site, first };
         let h = self.handle(site, &src, false, props)?;
-        let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
         let mip = if image.is_some() && !uav {
@@ -6568,6 +6580,8 @@ impl<'a> Lower<'a> {
         } else {
             self.s.m.undef(i32t)
         };
+        let h = self.raw_size_handle(h, &src, image.is_some(), props)?;
+        let c = self.cur;
         let d = self
             .s
             .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);

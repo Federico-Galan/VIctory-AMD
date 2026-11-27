@@ -281,16 +281,31 @@ fn widest(amd: bool) -> u32 {
     if amd && on { 1 << 20 } else { 65_535 }
 }
 
-/// Whether `device` is an AMD card's.
-pub(crate) fn amd(device: &ID3D12Device) -> bool {
+/// Reads the DXGI adapter description for `device`.
+fn adapter_desc(device: &ID3D12Device) -> Option<windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_DESC1> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
     // SAFETY: plain queries.
     unsafe {
         CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
             .and_then(|a| a.GetDesc1())
-            .is_ok_and(|d| d.VendorId == 0x1002)
+            .ok()
     }
+}
+
+/// Whether `device` is an AMD card's.
+pub(crate) fn amd(device: &ID3D12Device) -> bool {
+    adapter_desc(device).is_some_and(|d| d.VendorId == 0x1002)
+}
+
+/// Whether the device is an AMD RDNA 4 card ([`rdna4_id`]).
+pub(crate) fn rdna4(device: &ID3D12Device) -> bool {
+    adapter_desc(device).is_some_and(|d| rdna4_id(d.VendorId, d.DeviceId))
+}
+
+/// AMD's RDNA 4 device ids: 0x7550-0x75ff (Navi 48, Navi 44).
+pub(crate) fn rdna4_id(vendor: u32, device: u32) -> bool {
+    vendor == 0x1002 && (0x7550..=0x75ff).contains(&device)
 }
 
 /// Whether a record that does not fit in what is left of its list's budget
@@ -3922,5 +3937,17 @@ void work() {
             least.push(runs[0].0);
         }
         assert!(least.iter().all(|us| us.is_finite() && *us > 0.0), "the card gave no time for a batch");
+    }
+}
+
+#[cfg(test)]
+mod rdna4_tests {
+    #[test]
+    fn rdna4_is_amds_0x7550_to_0x75ff() {
+        assert!(super::rdna4_id(0x1002, 0x7550));
+        assert!(super::rdna4_id(0x1002, 0x7590)); // RX 9060 XT
+        assert!(super::rdna4_id(0x1002, 0x75ff));
+        assert!(!super::rdna4_id(0x1002, 0x744c)); // RX 7900 XTX
+        assert!(!super::rdna4_id(0x10de, 0x7550));
     }
 }

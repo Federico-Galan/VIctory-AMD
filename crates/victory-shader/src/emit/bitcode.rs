@@ -226,6 +226,8 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Instructions the clean-up passes leave as they are ([`Module::keep_since`]).
+    pub(crate) kept: std::collections::HashSet<u32>,
 }
 
 impl Module {
@@ -384,6 +386,18 @@ impl Module {
         {
             self.tags.insert(i, tag);
         }
+    }
+
+    /// How many instructions there are so far: with [`Module::keep_since`],
+    /// those made in between stay their own (no clean-up pass folds them or
+    /// merges them with equal ones; their operands are still cleaned up).
+    pub fn mark(&self) -> u32 {
+        self.insts.len() as u32
+    }
+
+    /// Every instruction made since `mark` stays its own.
+    pub fn keep_since(&mut self, mark: u32) {
+        self.kept.extend(mark..self.insts.len() as u32);
     }
 
     pub fn new_block(&mut self) -> usize {

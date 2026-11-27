@@ -63,6 +63,13 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     }
 }
 
+/// Immediately drops rested empty staging upload blocks when a host allocation fails with OOM.
+pub(crate) fn reclaim_staging_urgent() {
+    if let Ok(mut pool) = STAGING.try_lock() {
+        pool.reclaim(now(), 0, true);
+    }
+}
+
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
         Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,

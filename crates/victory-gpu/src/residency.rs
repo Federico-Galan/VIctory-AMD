@@ -125,7 +125,11 @@ pub(crate) fn refresh() {
                 "host memory pressure: limiting texture prefetch and idle upload storage"
             );
         } else {
-            tracing::info!(physical_free_mib = physical >> 20, available_commit_mib = commit >> 20, "host memory pressure cleared");
+            tracing::info!(
+                physical_free_mib = physical >> 20,
+                available_commit_mib = commit >> 20,
+                "host memory pressure cleared"
+            );
         }
     }
 }

@@ -1363,23 +1363,58 @@ fn snapshots_kept() -> usize {
 
 /// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
 /// the largest, and of those the largest one and the next ones up to `KEPT`
-/// bytes in all.
+/// bytes in all (trimmed down under host memory pressure).
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let limit = snapshot_pool_limit();
+    if limit == 0 {
+        drop(v);
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
+    let gone = cap_snapshot_pool(&mut pool, limit);
+    drop(pool);
+    drop(gone);
+}
+
+fn snapshot_pool_limit() -> usize {
+    if crate::residency::critical_commit() {
+        0
+    } else if crate::residency::pressured() {
+        64 << 20
+    } else {
+        512 << 20
+    }
+}
+
+fn cap_snapshot_pool(pool: &mut Vec<Vec<u8>>, limit: usize) -> Vec<Vec<u8>> {
+    if limit == 0 {
+        return std::mem::take(pool);
+    }
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > limit {
             break;
         }
         kept += 1;
     }
-    // (Given back to the kernel without the lock: milliseconds.)
-    let gone = pool.split_off(kept);
-    drop(pool);
+    pool.split_off(kept)
+}
+
+/// Drops idle snapshot buffers held in [`POOL`] under host memory pressure or OOM.
+pub(crate) fn trim_snapshot_pool() {
+    let limit = snapshot_pool_limit();
+    let gone = {
+        let Ok(mut pool) = POOL.try_lock() else {
+            return;
+        };
+        if pool.is_empty() {
+            return;
+        }
+        cap_snapshot_pool(&mut pool, limit)
+    };
     drop(gone);
 }
 

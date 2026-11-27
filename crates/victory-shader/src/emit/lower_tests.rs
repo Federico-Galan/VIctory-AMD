@@ -394,6 +394,14 @@
     }
 
     #[test]
+    fn the_raw_size_switch_reads_one_and_zero() {
+        assert_eq!(super::raw_size_asked(Some("1")), Some(true));
+        assert_eq!(super::raw_size_asked(Some(" 0 ")), Some(false));
+        assert_eq!(super::raw_size_asked(Some("yes")), None);
+        assert_eq!(super::raw_size_asked(None), None);
+    }
+
+    #[test]
     fn perm_dynamic_selector_needs_no_int64() {
         assert_eq!(
             perm_features(256) & 0x8000,
