@@ -1,32 +1,37 @@
-//! `victory`: the command-line front end.
+//! `scarlett`: the command-line front end.
 //!
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+
+// Agility SDK opt-in: Windows 10 needs the D3D12 runtime from .\D3D12\ next to the executable
+#[repr(transparent)]
+pub struct SdkPath(*const u8);
+unsafe impl Sync for SdkPath {}
+
+#[used]
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)]
+pub static D3D12SDKVersion: u32 = 614;
+
+#[used]
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)]
+pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr().cast());
 mod census;
 mod inspect;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod replay;
 mod run;
 mod shader;
 mod translate;
+#[cfg(windows)]
+mod warm;
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-
-#[cfg(windows)]
-#[repr(transparent)]
-pub struct ExportPtr(pub *const std::ffi::c_char);
-#[cfg(windows)]
-unsafe impl Sync for ExportPtr {}
-
-#[cfg(windows)]
-#[unsafe(export_name = "D3D12SDKVersion")]
-pub static D3D12SDK_VERSION: u32 = 614;
-
-#[cfg(windows)]
-#[unsafe(export_name = "D3D12SDKPath")]
-pub static D3D12SDK_PATH: ExportPtr = ExportPtr(c".\\D3D12\\".as_ptr());
 
 #[derive(Parser)]
 #[command(
@@ -85,7 +90,7 @@ enum Command {
     /// translator and report what it cannot handle yet.
     Translate {
         paths: Vec<PathBuf>,
-        /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
+        /// Check emitted DXIL with dxil.dll's validator (`SCARLETT_DXIL`,
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
@@ -101,11 +106,59 @@ enum Command {
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
         /// the containers with those hashes are translated into the
-        /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` and
-        /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
+        /// cache and nothing else is done. Set `SCARLETT_HOST_WAVE` and
+        /// `SCARLETT_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
     },
+    /// Translate every shader found (as `translate` finds them) into the
+    /// shader cache, so that no run has to: a few minutes, once per change
+    /// of the translator.
+    Shaders {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
+    /// Make the host pipelines of every pipeline the title ever created
+    /// (runs with `SCARLETT_PIPELINE_BOOK=1` write them down), so that the
+    /// driver's cache on disk has them before a run needs one: once per change
+    /// of the translator or the driver. Goes on where it was stopped.
+    #[cfg(windows)]
+    Warm {
+        /// Processes at once (default: two thirds of the logical cores).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// At most this many pipelines.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Those made before too.
+        #[arg(long)]
+        again: bool,
+        /// Only the pipelines earlier runs drew with.
+        #[arg(long)]
+        used: bool,
+        /// (What the processes it starts are given.)
+        #[arg(long, hide = true)]
+        these: Option<String>,
+    },
+    /// Build everything ahead of a run, no game window, on every core: all
+    /// shader translations, then the host pipelines earlier runs drew with
+    /// into the pipeline library (with --all, every other known pipeline for
+    /// the driver's cache too). Progress: `prepare step|progress|done` lines.
+    #[cfg(windows)]
+    Prepare {
+        /// Threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Also every other pipeline the title ever created (long).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Print the shader translator's fingerprint (`translator <hex>`): the
+    /// shader cache is valid for one fingerprint, so a launcher re-prepares
+    /// only when it changes.
+    Fingerprint,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -126,6 +179,10 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Run a captured frame's GPU work again (diagnostics builds; see
+    /// docs/replay.md).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -143,8 +200,9 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    victory_core::env::alias_scarlett();
     victory_core::logging::init("info");
-    // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
+    // The audio recorder `run` starts for `SCARLETT_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
@@ -175,12 +233,12 @@ fn main() -> Result<()> {
             jobs,
             warm,
         } => {
-            // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
-            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+            // `SCARLETT_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
+            if let Some(n) = std::env::var("SCARLETT_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+            // `SCARLETT_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+            if let Some(n) = std::env::var("SCARLETT_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
             if let Some(file) = warm {
@@ -188,14 +246,28 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        #[cfg(windows)]
+        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(windows)]
+        Command::Prepare { jobs, all } => warm::prepare(jobs, all),
+        Command::Fingerprint => {
+            println!("translator {}", victory_hle::SHADER_TRANSLATOR);
+            Ok(())
+        }
         Command::Run {
             exe,
             unimplemented,
             strict,
             execute,
             console,
-            title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+            title_args,
+        } => {
+            victory_hle::runtime::set_title_args(title_args);
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
     }
 }
@@ -241,7 +313,7 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
     anyhow::ensure!(
         !all.is_empty(),
-        "no paths given and none configured (see victory.example.toml)"
+        "no paths given and none configured (see scarlett.example.toml)"
     );
     Ok(all)
 }

@@ -1,6 +1,6 @@
 //! Fingerprint of the translator's own source, for the shader cache key
 //! (`victory-gpu`'s `shader_cache`): a rebuilt executable whose translator did
-//! not change keeps its cached translations. Also lists every `VICTORY_*`
+//! not change keeps its cached translations. Also lists every `SCARLETT_*`
 //! switch the translator reads, whose values join the key at run time.
 //! Reads only this crate's `src` folder; writes nothing but cargo directives.
 
@@ -48,7 +48,7 @@ fn main() {
         fnv(&mut state, &text);
         let s = String::from_utf8_lossy(&text);
         let mut rest = &s[..];
-        while let Some(at) = rest.find("\"VICTORY_") {
+        while let Some(at) = rest.find("\"SCARLETT_") {
             let tail = &rest[at + 1..];
             let end = tail
                 .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
@@ -59,7 +59,7 @@ fn main() {
             rest = &tail[end..];
         }
     }
-    println!("cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={:016x}{:016x}", state[0], state[1]);
+    println!("cargo:rustc-env=SCARLETT_SHADER_SOURCE_HASH={:016x}{:016x}", state[0], state[1]);
     let joined: Vec<_> = switches.into_iter().collect();
-    println!("cargo:rustc-env=VICTORY_SHADER_SWITCHES={}", joined.join(","));
+    println!("cargo:rustc-env=SCARLETT_SHADER_SWITCHES={}", joined.join(","));
 }

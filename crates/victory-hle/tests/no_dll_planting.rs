@@ -7,7 +7,7 @@ use victory_pe::ImportSymbol;
 
 #[test]
 fn ignores_dlls_in_current_folder() {
-    let name = "msvcp140_victorytest.dll";
+    let name = "msvcp140_scarletttest.dll";
     assert!(
         HostPolicy::default().allows(name),
         "test needs an allow-listed name"

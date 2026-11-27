@@ -1,7 +1,7 @@
 //! Where the user's files live.
 //!
 //! Resolution order for each value: environment variable, then the config
-//! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
+//! file (`SCARLETT_CONFIG` / `VICTORY_CONFIG`, else `./victory.toml`), then the default.
 //! See `victory.example.toml` at the repository root.
 
 use std::path::{Path, PathBuf};
@@ -26,8 +26,9 @@ pub struct Config {
     pub source: Option<PathBuf>,
 }
 
+/// Other sections are ignored: the ScarlettPort launcher writes `[display]`, `[game]` and
+/// `[pace]` for older runtimes into the same file. Keys inside `[paths]` stay checked.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
@@ -46,7 +47,7 @@ struct FilePaths {
 impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
-        let explicit = std::env::var_os("VICTORY_CONFIG").map(PathBuf::from);
+        let explicit = explicit_config_path(|k| std::env::var_os(k));
         let path = explicit
             .clone()
             .unwrap_or_else(|| PathBuf::from("victory.toml"));
@@ -56,7 +57,7 @@ impl Config {
             Some((path, text))
         } else if let Some(p) = explicit {
             anyhow::bail!(
-                "VICTORY_CONFIG points at {}, which does not exist",
+                "SCARLETT_CONFIG / VICTORY_CONFIG points at {}, which does not exist",
                 p.display()
             );
         } else {
@@ -79,20 +80,20 @@ impl Config {
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
         let env_path = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-        let test_titles = match env("VICTORY_TEST_TITLES") {
+        let test_titles = match env("SCARLETT_TEST_TITLES") {
             Some(v) if !v.is_empty() => std::env::split_paths(&v)
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect(),
             _ => file.test_titles,
         };
-        let cache_dir = env_path("VICTORY_CACHE_DIR")
+        let cache_dir = env_path("SCARLETT_CACHE_DIR")
             .or(file.cache_dir)
             .map_or_else(|| default_dir("cache"), Ok)?;
-        let data_dir = env_path("VICTORY_DATA_DIR")
+        let data_dir = env_path("SCARLETT_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
         Ok(Config {
-            game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
+            game_dir: env_path("SCARLETT_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
             test_titles,
@@ -119,6 +120,14 @@ impl Config {
     }
 }
 
+/// The config file explicitly named by the environment, if any. An empty
+/// `SCARLETT_CONFIG` means unset, like the other path variables.
+fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env("SCARLETT_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     let dir = root.join(sub);
     ensure_outside_repo(&dir)?;
@@ -135,7 +144,6 @@ fn default_dir(name: &str) -> Result<PathBuf> {
         .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
     Ok(base.join("victory").join(name))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,7 +156,7 @@ mod tests {
             cache_dir: Some("cache-from-file".into()),
             ..Default::default()
         };
-        let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
+        let env = |k: &str| (k == "SCARLETT_GAME_DIR").then(|| OsString::from("from-env"));
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
@@ -160,7 +168,7 @@ mod tests {
             game_dir: Some("from-file".into()),
             ..Default::default()
         };
-        let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
+        let env = |k: &str| (k == "SCARLETT_GAME_DIR").then(OsString::new);
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
     }
@@ -171,7 +179,7 @@ mod tests {
             test_titles: vec!["from-file".into()],
             ..Default::default()
         };
-        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
+        let env = |k: &str| (k == "SCARLETT_TEST_TITLES").then(OsString::new);
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
     }
@@ -180,7 +188,7 @@ mod tests {
     fn test_titles_env_splits_paths() {
         let value = std::env::join_paths(["first", "second"]).unwrap();
         let file = FilePaths::default();
-        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
+        let env = |k: &str| (k == "SCARLETT_TEST_TITLES").then(|| value.clone());
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(
             cfg.test_titles,
@@ -189,10 +197,29 @@ mod tests {
     }
 
     #[test]
+    fn empty_config_env_is_ignored() {
+        let empty = |k: &str| (k == "SCARLETT_CONFIG").then(OsString::new);
+        assert_eq!(explicit_config_path(empty), None);
+        let set = |k: &str| (k == "SCARLETT_CONFIG").then(|| OsString::from("custom.toml"));
+        assert_eq!(
+            explicit_config_path(set),
+            Some(PathBuf::from("custom.toml"))
+        );
+    }
+
+    #[test]
     fn example_config_parses() {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+    }
+
+    #[test]
+    fn launcher_sections_are_ignored_and_paths_stay_checked() {
+        let text = "[display]\nhdr = false\n\n[game]\nrumble = true\n\n[pace]\npace = false\n\n[paths]\ngame_dir = \"D:/game\"\n";
+        let parsed: FileConfig = toml::from_str(text).unwrap();
+        assert_eq!(parsed.paths.game_dir, Some(PathBuf::from("D:/game")));
+        assert!(toml::from_str::<FileConfig>("[paths]\ngame_folder = \"D:/game\"\n").is_err());
     }
 
     #[test]

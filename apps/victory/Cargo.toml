@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "victory"
+path = "src/main.rs"
+
 [dependencies]
 victory-core.workspace = true
 victory-pe.workspace = true
@@ -19,6 +23,9 @@ blake3.workspace = true
 memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,

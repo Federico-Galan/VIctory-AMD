@@ -58,6 +58,21 @@ pub const XUID: u64 = 0x0009_0000_0000_0001;
 pub const LOCAL_ID: u64 = 1;
 const GAMERTAG: &str = "Player";
 
+/// The player name: `SCARLETT_GAMERTAG` (at most 15 characters, as on the
+/// console), else "Player".
+fn gamertag() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let v = std::env::var("SCARLETT_GAMERTAG").unwrap_or_default();
+        let v: String = v.trim().chars().take(15).collect();
+        if v.is_empty() {
+            GAMERTAG.to_string()
+        } else {
+            v
+        }
+    })
+}
+
 /// The only user; a handle is its address, duplicating and closing are free.
 pub struct User;
 static USER: User = User;
@@ -168,7 +183,7 @@ extern "system" fn get_gamertag(
     const MODERN_SUFFIX: u32 = 2;
     let text = match component {
         MODERN_SUFFIX => "",
-        _ => GAMERTAG,
+        _ => gamertag(),
     };
     put_string(text, size, buffer, used)
 }

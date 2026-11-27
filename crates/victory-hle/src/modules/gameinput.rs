@@ -113,6 +113,33 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// The mouse as a right stick (mouse look), `None` when off or unfocused.
+    fn look(&mut self) -> Option<PadState> {
+        None
+    }
+}
+
+/// Mouse look sensitivity: `SCARLETT_MOUSE_LOOK` (0 or unset turns it off,
+/// keeping the mouse cursor unlocked).
+fn parse_mouse_look(value: Option<&str>) -> f32 {
+    value
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0)
+        .clamp(0.0, 10.0)
+}
+
+fn mouse_look_sensitivity() -> f32 {
+    static S: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *S.get_or_init(|| parse_mouse_look(std::env::var("SCARLETT_MOUSE_LOOK").ok().as_deref()))
+}
+
+/// A mouse movement of `dx`, `dy` pixels since the last poll as a right
+/// stick (up positive), eased with the last reading so it does not flicker.
+fn look_stick(dx: i32, dy: i32, sensitivity: f32, last: (f32, f32)) -> (f32, f32) {
+    let to = |d: i32| (d as f32 * sensitivity / 24.0).clamp(-1.0, 1.0);
+    let (x, y) = (to(dx), -to(dy));
+    ((x + last.0) / 2.0, (y + last.1) / 2.0)
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -135,6 +162,32 @@ fn fallback(keys: &[KeyState]) -> PadState {
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
     }
+}
+
+/// Two pads as one: buttons of both, and of each axis and trigger the one
+/// pushed further.
+fn merged(a: PadState, b: PadState) -> PadState {
+    let further = |x: f32, y: f32| if y.abs() > x.abs() { y } else { x };
+    PadState {
+        buttons: a.buttons | b.buttons,
+        left_trigger: further(a.left_trigger, b.left_trigger),
+        right_trigger: further(a.right_trigger, b.right_trigger),
+        left_x: further(a.left_x, b.left_x),
+        left_y: further(a.left_y, b.left_y),
+        right_x: further(a.right_x, b.right_x),
+        right_y: further(a.right_y, b.right_y),
+    }
+}
+
+/// Whether the title sees one pad that is always there, fed by the keyboard
+/// and by every host pad (on by default; `SCARLETT_ONE_PAD=0` shows each host
+/// pad as a device of its own, and the stand-in only while there is none).
+/// The title keeps to the pad it started with: with the stand-in taken away
+/// when a pad was switched on, it showed its controller-disconnected screen
+/// until the pad was off again. It also keeps a pad the host lists twice (its
+/// own slot and a remapper's) from being two players.
+fn one_pad() -> bool {
+    std::env::var_os("SCARLETT_ONE_PAD").is_none_or(|v| v != "0")
 }
 
 #[repr(C)]
@@ -194,7 +247,7 @@ fn kind(index: usize) -> u32 {
 impl Device {
     fn new(index: usize) -> Device {
         let mut id = [0; 32];
-        id[..7].copy_from_slice(b"victory");
+        id[..8].copy_from_slice(b"scarlett");
         id[31] = index as u8 + 1;
         let info = DeviceInfo {
             size: size_of::<DeviceInfo>() as u32,
@@ -202,7 +255,7 @@ impl Device {
             root_id: id,
             supported_input: kind(index),
             // Low and high frequency.
-            rumble_motors: if index < PADS { 0x3 } else { 0 },
+            rumble_motors: if index <= FALLBACK { 0x3 } else { 0 },
             ..Default::default()
         };
         Device {
@@ -333,6 +386,8 @@ pub struct Hub {
     /// Apart from the state: XInput can be slow, and the title reads
     /// readings every frame.
     source: Mutex<Box<dyn Source>>,
+    /// The title sees one pad ([`one_pad`]).
+    one_pad: bool,
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -356,7 +411,7 @@ fn now() -> u64 {
 }
 
 impl Hub {
-    fn new(source: Box<dyn Source>) -> &'static Hub {
+    fn new(source: Box<dyn Source>, one_pad: bool) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -364,6 +419,7 @@ impl Hub {
             },
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
+            one_pad,
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -384,7 +440,7 @@ impl Hub {
 
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source);
+        let hub = Hub::new(source, one_pad());
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -401,12 +457,18 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, mut keys) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            if self.one_pad
+                && let Some(look) = source.look()
+            {
+                pads[0] = Some(pads[0].map_or(look, |p| merged(p, look)));
+            }
             (pads, source.keys())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        scripted_input(&mut keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
         self.deliver(events);
     }
 
@@ -449,11 +511,18 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
+        one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        if one_pad {
+            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
+            self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
+            return events;
+        }
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
@@ -507,6 +576,98 @@ impl State {
                     .map(|r| r.event(index, now, current, previous)),
             );
         }
+    }
+}
+
+/// SCARLETT_PRESS_FILE=<path>: buttons written to that file ("A", "DOWN DOWN A",
+/// "LS_UP RS_RIGHT") are held one after another, then the file is emptied.
+/// Buttons are held 150 ms, stick tokens (LS_*, RS_*) 1.5 s.
+fn live_press(keys: &mut Vec<KeyState>) {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    static Q: Mutex<(Option<Instant>, Vec<u8>, Option<Instant>)> = Mutex::new((None, Vec::new(), None));
+    let Some(path) = PATH.get_or_init(|| std::env::var("SCARLETT_PRESS_FILE").ok()) else { return };
+    let mut q = Q.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if q.1.is_empty() && q.0.is_none_or(|t| now - t >= Duration::from_millis(50)) {
+        q.0 = Some(now);
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if !s.trim().is_empty() {
+                let _ = std::fs::write(path, "");
+                q.1 = s
+                    .split_whitespace()
+                    .rev()
+                    .filter_map(|b| match b.to_ascii_uppercase().as_str() {
+                        "A" => Some(0x0D),
+                        "B" => Some(0x08),
+                        "UP" => Some(0x26),
+                        "DOWN" => Some(0x28),
+                        "LEFT" => Some(0x25),
+                        "RIGHT" => Some(0x27),
+                        "MENU" | "START" => Some(0x1B),
+                        "VIEW" => Some(0x09),
+                        "LS_UP" => Some(b'W'),
+                        "LS_DOWN" => Some(b'S'),
+                        "LS_LEFT" => Some(b'A'),
+                        "LS_RIGHT" => Some(b'D'),
+                        "RS_UP" => Some(b'I'),
+                        "RS_DOWN" => Some(b'K'),
+                        "RS_LEFT" => Some(b'J'),
+                        "RS_RIGHT" => Some(b'L'),
+                        "X" => Some(b'X'),
+                        "Y" => Some(b'Y'),
+                        _ => None,
+                    })
+                    .collect();
+                q.2 = Some(now);
+            }
+        }
+    }
+    let Some(&vk) = q.1.last() else { return };
+    let held = q.2.map_or(Duration::ZERO, |t| now - t);
+    let hold = if b"WASDIJKL".contains(&vk) { 1500 } else { 150 };
+    if held < Duration::from_millis(hold) {
+        keys.push(KeyState { scan_code: 0, code_point: 0, virtual_key: vk, dead_key: false });
+    } else if held >= Duration::from_millis(hold + 150) {
+        q.1.pop();
+        q.2 = Some(now);
+    }
+}
+
+/// Scripted input for unattended test runs, added to the host keys (and so
+/// to the keyboard stand-in pad). Every source is off unless its switch is set.
+fn scripted_input(keys: &mut Vec<KeyState>) {
+    live_press(keys);
+    fast_boot_keys(keys);
+}
+
+/// SCARLETT_FAST_BOOT (testing only): A on every other presented frame and
+/// START on one frame in eight until the title is in the world (logos,
+/// menus, the account prompt); then, with SCARLETT_SKIP_CUTSCENES=1, A on
+/// every other poll for a while so the intro cutscene skips; then nothing.
+fn fast_boot_keys(keys: &mut Vec<KeyState>) {
+    use victory_gpu::fastboot;
+    let key = |scan: u32, vk: u8| KeyState {
+        scan_code: scan,
+        code_point: u32::from(vk),
+        virtual_key: vk,
+        dead_key: false,
+    };
+    if fastboot::skipping() {
+        static READS: AtomicU64 = AtomicU64::new(0);
+        if READS.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
+            keys.push(key(0x1C, 0x0D));
+        }
+        return;
+    }
+    if !fastboot::active() {
+        return;
+    }
+    let frame = fastboot::frame();
+    if frame % 2 == 0 {
+        keys.push(key(0x1C, 0x0D));
+    } else if frame % 8 == 1 {
+        keys.push(key(0x01, 0x1B));
     }
 }
 
@@ -915,7 +1076,8 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
-    if device.index >= PADS {
+    let one_pad = device.hub().one_pad;
+    if device.index >= PADS && !(one_pad && device.index == FALLBACK) {
         return;
     }
     let [low, high, ..] = if params.is_null() {
@@ -925,7 +1087,17 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    let mut source = lock(&device.hub().source);
+    if one_pad {
+        // The one pad is every host pad.
+        for slot in 0..PADS {
+            if source.pad(slot).is_some() {
+                source.rumble(slot, speed(low), speed(high));
+            }
+        }
+    } else {
+        source.rumble(device.index, speed(low), speed(high));
+    }
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1067,7 +1239,12 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// Host input: XInput pads, the keyboard while our process has focus.
+/// PlayStation pads read as HID devices (`SCARLETT_PAD_PS`).
+#[cfg(windows)]
+mod playstation;
+
+/// Host input: XInput pads, a PlayStation pad as pad 0 when XInput has
+/// none there, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
@@ -1084,8 +1261,9 @@ mod host {
         XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState,
         XInputSetState,
     };
+    use windows_sys::Win32::Foundation::{POINT, RECT};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, SetCursorPos,
     };
 
     use super::*;
@@ -1130,27 +1308,31 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// The last mouse look stick, for easing.
+        look: (f32, f32),
     }
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            // With no XInput pad in the first slot, a PlayStation pad
+            // stands in for it (`super::playstation`).
+            let instead = |slot: usize| if slot == 0 { super::playstation::pad() } else { None };
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
+                return instead(slot);
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
+                return instead(slot);
             }
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
+            // The scripted keys (`SCARLETT_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1162,10 +1344,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1188,6 +1367,27 @@ mod host {
                 .collect()
         }
 
+        fn look(&mut self) -> Option<PadState> {
+            let sensitivity = mouse_look_sensitivity();
+            if sensitivity <= 0.0 || !focused() {
+                self.look = (0.0, 0.0);
+                return None;
+            }
+            let mut at = POINT { x: 0, y: 0 };
+            let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            // SAFETY: plain queries into locals; the window is ours (focused).
+            let ok = unsafe { GetCursorPos(&mut at) != 0 && GetWindowRect(GetForegroundWindow(), &mut rect) != 0 };
+            if !ok {
+                return None;
+            }
+            let (cx, cy) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+            // The pointer goes back to the window's middle each poll, so it never reaches an edge.
+            // SAFETY: plain call.
+            unsafe { SetCursorPos(cx, cy) };
+            self.look = look_stick(at.x - cx, at.y - cy, sensitivity, self.look);
+            Some(PadState { right_x: self.look.0, right_y: self.look.1, ..Default::default() })
+        }
+
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
@@ -1198,14 +1398,14 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
+    /// Debugging aid: `SCARLETT_KEYS=<seconds>:<key>,...` holds each key for
+    /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
+    /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
+            let list = std::env::var("SCARLETT_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
                 let vk = match key.trim() {
@@ -1222,19 +1422,28 @@ mod host {
                     }
                     _ => return None,
                 };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
+                let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
+                let (from, to) = match at.split_once('-') {
+                    Some((from, to)) => (time(from)?, time(to)?),
+                    None => (time(at)?, time(at)? + Duration::from_millis(200)),
+                };
+                Some((from, to, vk))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        let mut down: Vec<u8> = keys
+            .iter()
+            .filter(|&&(from, to, _)| (from..to).contains(&now))
+            .map(|&(_, _, vk)| vk)
+            .collect();
+        // SCARLETT_PRESS_FILE presses reach the first host pad too: with a real pad
+        // connected the title listens to that pad, not to the keyboard stand-in.
+        let mut pressed = Vec::new();
+        super::live_press(&mut pressed);
+        down.extend(pressed.iter().map(|k| k.virtual_key));
+        down
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1302,8 +1511,12 @@ mod tests {
     }
 
     fn fake() -> (&'static Hub, Arc<Mutex<FakeHost>>) {
+        fake_with(false)
+    }
+
+    fn fake_with(one_pad: bool) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
-        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
+        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), one_pad);
         hub.poll();
         (hub, host)
     }
@@ -1488,6 +1701,24 @@ mod tests {
     }
 
     #[test]
+    fn mouse_look_is_off_by_default_and_clamps_valid_values() {
+        assert_eq!(parse_mouse_look(None), 0.0);
+        assert_eq!(parse_mouse_look(Some("0")), 0.0);
+        assert_eq!(parse_mouse_look(Some("invalid")), 0.0);
+        assert_eq!(parse_mouse_look(Some("1.5")), 1.5);
+        assert_eq!(parse_mouse_look(Some("25")), 10.0);
+    }
+
+    #[test]
+    fn mouse_look_turns_into_a_right_stick() {
+        let (x, y) = look_stick(48, -12, 1.0, (0.0, 0.0));
+        assert!((x - 0.5).abs() < 1e-6 && (y - 0.25).abs() < 1e-6, "{x} {y}");
+        let (x, _) = look_stick(0, 0, 1.0, (1.0, 0.0));
+        assert!((x - 0.5).abs() < 1e-6);
+        assert_eq!(look_stick(1000, 0, 2.0, (0.0, 0.0)).0, 0.5);
+    }
+
+    #[test]
     fn keys_feed_the_keyboard_and_the_stand_in_pad() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1521,6 +1752,37 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn a_host_pad_feeds_the_one_pad_which_never_goes() {
+        let (hub, host) = fake_with(true);
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+        let pad = |hub: &Hub| match &hub.state().slots[FALLBACK].history.back().unwrap().value {
+            Value::Pad(p) => *p,
+            Value::Keys(_) => unreachable!(),
+        };
+        host.lock().unwrap().keys = vec![key(b'D')];
+        hub.poll();
+        assert_eq!(pad(hub).left_x, 1.0);
+        // A pad is switched on, in any slot: its input arrives, beside the
+        // keyboard's, and no device comes or goes.
+        host.lock().unwrap().pads[2] = Some(PadState { buttons: A, left_y: -0.5, ..Default::default() });
+        hub.poll();
+        let p = pad(hub);
+        assert_eq!((p.buttons, p.left_x, p.left_y), (A, 1.0, -0.5));
+        let device: *const Device = &hub.devices[FALLBACK];
+        set_rumble(device, &[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(host.lock().unwrap().rumble, [(2, u16::MAX, 0)]);
+        // And off again.
+        host.lock().unwrap().pads[2] = None;
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        assert_eq!(pad(hub), PadState::default());
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert!(!hub.state().slots[2].connected);
     }
 
     #[test]

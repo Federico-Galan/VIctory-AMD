@@ -1,7 +1,13 @@
 //! Presented frames written to PNG files, to see what reaches the screen:
-//! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
+//! with `SCARLETT_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
 //! size. Only in builds with diagnostics.
+//!
+//! With `SCARLETT_CAPTURE_LOG=1` as well, every present is a line of
+//! `frames.csv` there ([`log_frame`]), for comparing runs afterwards: a
+//! cutscene's frame numbers differ from run to run (it appears to wait
+//! while the title is paused or stalled). The fields: [`Row`]; the
+//! anchor: [`Log::step`].
 
 use std::path::PathBuf;
 
@@ -12,35 +18,35 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| std::env::var_os("SCARLETT_CAPTURE").map(PathBuf::from))
         .as_ref()
 }
 
-/// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
+/// Frames listed in `SCARLETT_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let named = LIST
         .get_or_init(|| {
-            let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
+            let list = std::env::var("SCARLETT_CAPTURE_FRAMES").unwrap_or_default();
             list.split(',')
                 .filter_map(|f| f.trim().parse().ok())
                 .collect()
         })
         .contains(&n);
-    // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
+    // `SCARLETT_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
     // the 80th (the title opens with a cutscene made in the
     // engine: later shots of it, in case the first is dark by design).
     //
-    // `VICTORY_CAPTURE_WORLD_ALSO` (comma-separated): more frames counted
+    // `SCARLETT_CAPTURE_WORLD_ALSO` (comma-separated): more frames counted
     // from that first one (the title's blue patches show from
     // about the 118th frame on, when the window's model has arrived and
     // the reflections hold values: none of the four above has them).
     static ALSO: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let also = ALSO.get_or_init(|| {
-        let list = std::env::var("VICTORY_CAPTURE_WORLD_ALSO").unwrap_or_default();
+        let list = std::env::var("SCARLETT_CAPTURE_WORLD_ALSO").unwrap_or_default();
         list.split(',')
             .filter_map(|f| f.trim().parse().ok())
             .collect()
@@ -58,18 +64,6 @@ pub(crate) fn listed(n: u64) -> bool {
 /// stays empty.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
-    // A frame shot (`crate::shot`) keeps every line of its frame.
-    if crate::shot::keeping_lines() {
-        let text = what();
-        crate::shot::line(list, &text);
-        return op_listed(list, move || text);
-    }
-    op_listed(list, what);
-}
-
-/// [`op`] for the frames [`listed`] and the lines before the world.
-#[cfg(feature = "diagnostics")]
-fn op_listed(list: usize, what: impl FnOnce() -> String) {
     use std::io::Write;
     let frame = crate::queue::presented() + 1;
     if !listed(frame) {
@@ -126,36 +120,22 @@ static RING: std::sync::Mutex<std::collections::VecDeque<String>> =
 #[cfg(feature = "diagnostics")]
 const RING_LINES: usize = 6000;
 
-/// Whether `VICTORY_CAPTURE_WORLD` is set.
+/// Whether `SCARLETT_CAPTURE_WORLD` is set.
 fn world_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
+    *ON.get_or_init(|| std::env::var_os("SCARLETT_CAPTURE_WORLD").is_some())
 }
 
-/// Every how many world frames a picture is saved with
-/// `VICTORY_CAPTURE_WORLD` (`VICTORY_CAPTURE_WORLD_EVERY`, 8 unless said).
-///
-/// A saved frame is read back at once and written as a PNG inside the
-/// present: run 225's frame log has every saved frame of the cell at 371 ms
-/// against a usual 136 (the present's own copy and show 137 ms instead of
-/// 2, and 123 ms more waiting for the card). At every 8th frame that was
-/// the regular dip of every test run, and a fifth of its time. A run that
-/// measures speed asks for 64 or more.
-fn world_every() -> u64 {
-    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| {
-        std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8)
-    })
-}
-
-/// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
+/// The first frame that ran 500 draws or more (`SCARLETT_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The draws run on the host by the last present ([`frame_drew`]).
+static DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let before = LAST.swap(drawn, Relaxed);
+    let before = DRAWN.swap(drawn, Relaxed);
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -172,25 +152,28 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
+    // Before the world, with `SCARLETT_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    if save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows) {
+        SAVED.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
-/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
-fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    let Some(folder) = folder() else { return };
+/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size; false if
+/// the file was not written.
+fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) -> bool {
+    let Some(folder) = folder() else { return false };
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -206,28 +189,31 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
             }
         }
     }
-    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut header = Vec::new();
-    header.extend(w.to_be_bytes());
-    header.extend(h.to_be_bytes());
-    header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
-    chunk(&mut png, b"IHDR", &header);
-    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
-    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
-    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
-    chunk(&mut png, b"IDAT", idat);
-    chunk(&mut png, b"IEND", &[]);
+    let png = encode(w, h, &raw);
     let path = folder.join(format!("{name}.png"));
     match std::fs::write(&path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "frame not saved");
+            return false;
+        }
     }
+    true
 }
 
-/// A PNG of `w` by `h` 8-bit RGB pixels; `raw` is its rows, each after a
-/// filter byte 0 (for `crate::shot`, whose pictures have names and sizes
-/// of their own).
-pub(crate) fn png_rgb(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
+/// A PNG of `width * height` pixels of 8-bit RGB.
+pub(crate) fn png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+    let row = width as usize * 3;
+    let mut raw = Vec::with_capacity((row + 1) * height as usize);
+    for line in rgb.chunks_exact(row.max(1)) {
+        raw.push(0);
+        raw.extend_from_slice(line);
+    }
+    encode(width, height, &raw)
+}
+
+/// A PNG of rows of RGB, each behind its filter byte.
+fn encode(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
     header.extend(w.to_be_bytes());
@@ -274,7 +260,7 @@ pub(crate) fn read_back(
 
 /// As [`read_back`], of subresource `sub` (the stencil plane of a
 /// one-level, one-slice depth-stencil texture is subresource 1).
-pub(crate) fn read_back_of(
+fn read_back_of(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
@@ -375,8 +361,8 @@ pub(crate) fn save_read_back(
     }
 }
 
-/// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
-/// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
+/// With `SCARLETT_DUMP_TARGETS` set: title textures the frames listed in
+/// `SCARLETT_CAPTURE_FRAMES` render to or write, in first-use order, saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
 /// (what each holds at the end of the frame; formats normalized to show
 /// structure: floats scaled by their largest value, depth by its range).
@@ -387,7 +373,7 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+    *ON.get_or_init(|| folder().is_some() && crate::switch::on("SCARLETT_DUMP_TARGETS"))
 }
 
 /// Notes a title texture the frame being built renders to or writes.
@@ -590,7 +576,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
-pub(crate) fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
+fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
@@ -850,6 +836,16 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
             .flat_map(|pixel| pixel[..3].iter().copied())
             .max()
             .unwrap_or(0);
+        if log_on() {
+            let points = std::array::from_fn(|i| {
+                bytes[i * SLOT as usize..][..3]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0)
+            });
+            *PROBED.lock().unwrap_or_else(|e| e.into_inner()) = Some(points);
+        }
         buffer.Unmap(0, None);
         let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
         if levels.len() == 12 {
@@ -868,6 +864,218 @@ static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
 pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
     levels.iter().copied().collect()
+}
+
+/// Sample points of the grid [`probe`] reads.
+const POINTS: usize = (GRID * GRID) as usize;
+
+/// The brightest channel at each point [`black`] read for the frame being
+/// presented, row by row, for [`log_frame`].
+static PROBED: std::sync::Mutex<Option<[u8; POINTS]>> = std::sync::Mutex::new(None);
+
+/// The last frame saved as `frame-<n>.png`.
+static SAVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `SCARLETT_CAPTURE_LOG=1` is set, with a capture folder.
+fn log_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        folder().is_some() && std::env::var_os("SCARLETT_CAPTURE_LOG").is_some_and(|v| v == "1")
+    })
+}
+
+/// The first line of `frames.csv`.
+const HEADER: &str = "frame,after_anchor,wall_ms,anchor_ms,frame_ms,drawn,saved,cut,probe_levels\n";
+
+/// A line of `frames.csv`; `None` is an empty field. `frame` is the number
+/// of `frame-<n>.png`; `after_anchor` and `anchor_ms` count frames and
+/// milliseconds from the anchor ([`Log::step`]), `wall_ms` from the first
+/// line and `frame_ms` from the line before (a pause or a stall is a long
+/// one), at the time the frame is shown ([`log_frame`]); `drawn` the host
+/// draws from the title's present before to this frame's.
+#[derive(Debug, PartialEq)]
+struct Row {
+    frame: u64,
+    after_anchor: Option<u64>,
+    wall_ms: f64,
+    anchor_ms: Option<f64>,
+    frame_ms: Option<f64>,
+    drawn: u64,
+    /// `frame-<n>.png` was written at this present (a slow one).
+    saved: bool,
+    /// [`shot_cut`] against the frame before; empty unless both were probed.
+    cut: Option<bool>,
+    /// The brightest channel at 16 sample points, row by row: only frames
+    /// read back at their present have them (with presents sent ahead, the
+    /// saved ones).
+    probe_levels: Option<[u8; POINTS]>,
+}
+
+/// The line of `frames.csv` for `r`.
+fn row(r: &Row) -> String {
+    fn or_empty<T: std::fmt::Display>(v: Option<T>) -> String {
+        v.map_or(String::new(), |v| v.to_string())
+    }
+    let ms = |v: Option<f64>| or_empty(v.map(|v| format!("{v:.1}")));
+    let levels = r.probe_levels.map(|l| l.map(|c| c.to_string()).join(" "));
+    format!(
+        "{},{},{:.1},{},{},{},{},{},{}\n",
+        r.frame,
+        or_empty(r.after_anchor),
+        r.wall_ms,
+        ms(r.anchor_ms),
+        ms(r.frame_ms),
+        r.drawn,
+        u8::from(r.saved),
+        or_empty(r.cut.map(u8::from)),
+        or_empty(levels),
+    )
+}
+
+/// Whether the probe levels changed as at a cut between shots: by more
+/// than 32 at 6 or more of the 16 sample points. A hint only: noise moves
+/// a point a few levels, a slow fade every point a little each frame, but
+/// a fast fade or a bright thing crossing the points counts as well.
+fn shot_cut(before: &[u8; POINTS], now: &[u8; POINTS]) -> bool {
+    before
+        .iter()
+        .zip(now)
+        .filter(|&(a, b)| a.abs_diff(*b) > 32)
+        .count()
+        >= 6
+}
+
+/// What [`log_frame`] keeps from one present to the next.
+struct Log {
+    start: std::time::Instant,
+    last: Option<std::time::Instant>,
+    /// Host draws at the present before.
+    drawn: u64,
+    /// The anchor's frame and its `wall_ms`.
+    anchor: Option<(u64, f64)>,
+    /// The frame before, if it was probed, and its levels.
+    probed: Option<(u64, [u8; POINTS])>,
+}
+
+impl Log {
+    fn new(start: std::time::Instant) -> Log {
+        Log {
+            start,
+            last: None,
+            drawn: 0,
+            anchor: None,
+            probed: None,
+        }
+    }
+
+    /// The line of `frame`, shown at `now`: `drawn` the host draws so far at
+    /// its present (as given to [`frame_drew`]), `world` the frame
+    /// `SCARLETT_CAPTURE_WORLD` counts from (if found, maybe not shown yet),
+    /// `levels` the frame's probe levels, `saved` whether its picture was
+    /// written. The anchor is the first frame of 500 draws or more, the same
+    /// rule as [`frame_drew`]'s: `world` when that switch has found it (at
+    /// that frame's line), else found here, so the log needs no saved frames.
+    fn step(
+        &mut self,
+        frame: u64,
+        now: std::time::Instant,
+        drawn: u64,
+        world: Option<u64>,
+        levels: Option<[u8; POINTS]>,
+        saved: bool,
+    ) -> Row {
+        let ms = |d: std::time::Duration| d.as_micros() as f64 / 1000.0;
+        let wall_ms = ms(now.saturating_duration_since(self.start));
+        let draws = drawn.saturating_sub(self.drawn);
+        // (With our thread writing the lines, the title may have found the
+        // world frame a frame or more on: it waits for that frame's line.)
+        let latch = match world {
+            Some(w) => w <= frame,
+            None => draws >= 500,
+        };
+        if self.anchor.is_none() && latch {
+            self.anchor = Some((world.unwrap_or(frame), wall_ms));
+        }
+        let cut = match (self.probed, levels) {
+            (Some((f, before)), Some(now)) if f + 1 == frame => Some(shot_cut(&before, &now)),
+            _ => None,
+        };
+        let row = Row {
+            frame,
+            after_anchor: self.anchor.map(|(f, _)| frame.saturating_sub(f)),
+            wall_ms,
+            anchor_ms: self.anchor.map(|(_, at)| wall_ms - at),
+            frame_ms: self
+                .last
+                .map(|last| ms(now.saturating_duration_since(last))),
+            drawn: draws,
+            saved,
+            cut,
+            probe_levels: levels,
+        };
+        self.last = Some(now);
+        self.drawn = drawn;
+        self.probed = levels.map(|l| (frame, l));
+        row
+    }
+}
+
+/// With `SCARLETT_CAPTURE_LOG=1`: `frame`'s line of `frames.csv`, written at
+/// once. Frame times are in `SCARLETT_FRAME_LOG` too; this log is keyed to
+/// the saved frames, the anchor and the probe. Written once the frame is
+/// shown, by the thread that shows it: the title's at its present, or ours
+/// with submissions sent by our thread (`SCARLETT_ASYNC_SUBMIT=1` or
+/// `SCARLETT_THIN=1`), after the title's present; `wall_ms` and `frame_ms`
+/// are times of showing. `drawn`: the host draws so far at the title's
+/// present of it (as given to [`frame_drew`]).
+pub(crate) fn log_frame(frame: u64, drawn: u64) {
+    use std::io::Write;
+    struct Out {
+        file: std::fs::File,
+        log: Log,
+        failed: bool,
+    }
+    static OUT: std::sync::OnceLock<Option<std::sync::Mutex<Out>>> = std::sync::OnceLock::new();
+    if !log_on() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let Some(out) = OUT.get_or_init(|| {
+        let path = folder()?.join("frames.csv");
+        let file = std::fs::File::create(&path)
+            .and_then(|mut file| file.write_all(HEADER.as_bytes()).map(|()| file))
+            .inspect_err(
+                |e| tracing::warn!(error = %e, path = %path.display(), "frame log not made"),
+            )
+            .ok()?;
+        tracing::info!(path = %path.display(), "a line per present (SCARLETT_CAPTURE_LOG=1)");
+        let log = Log::new(now);
+        Some(std::sync::Mutex::new(Out {
+            file,
+            log,
+            failed: false,
+        }))
+    }) else {
+        return;
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
+    let first = WORLD.load(Relaxed);
+    let levels = PROBED.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let line = row(&out.log.step(
+        frame,
+        now,
+        drawn,
+        (first != u64::MAX).then_some(first),
+        levels,
+        SAVED.load(Relaxed) == frame,
+    ));
+    if let Err(e) = out.file.write_all(line.as_bytes())
+        && !out.failed
+    {
+        out.failed = true;
+        tracing::warn!(error = %e, frame, "frame log line not written (said once)");
+    }
 }
 
 #[cfg(test)]
@@ -889,5 +1097,143 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    /// Before the anchor its fields are empty, as are the ones not known
+    /// yet; the header names as many fields as a line has.
+    #[test]
+    fn frame_log_lines_leave_unknown_fields_empty() {
+        let first = super::Row {
+            frame: 1,
+            after_anchor: None,
+            wall_ms: 0.0,
+            anchor_ms: None,
+            frame_ms: None,
+            drawn: 3,
+            saved: true,
+            cut: None,
+            probe_levels: None,
+        };
+        assert_eq!(super::row(&first), "1,,0.0,,,3,1,,\n");
+        let mut levels = [0u8; super::POINTS];
+        levels[0] = 255;
+        levels[15] = 7;
+        let later = super::Row {
+            frame: 1234,
+            after_anchor: Some(30),
+            wall_ms: 61_234.56,
+            anchor_ms: Some(1_000.04),
+            frame_ms: Some(33.36),
+            drawn: 1_480,
+            saved: false,
+            cut: Some(true),
+            probe_levels: Some(levels),
+        };
+        assert_eq!(
+            super::row(&later),
+            "1234,30,61234.6,1000.0,33.4,1480,0,1,255 0 0 0 0 0 0 0 0 0 0 0 0 0 0 7\n"
+        );
+        let fields = |s: &str| s.trim_end().split(',').count();
+        assert_eq!(
+            super::HEADER,
+            "frame,after_anchor,wall_ms,anchor_ms,frame_ms,drawn,saved,cut,probe_levels\n"
+        );
+        assert_eq!(fields(super::HEADER), fields(&super::row(&first)));
+        assert_eq!(fields(super::HEADER), fields(&super::row(&later)));
+    }
+
+    #[test]
+    fn shot_cuts_are_big_changes_at_many_points() {
+        let dark = [20u8; super::POINTS];
+        // Noise: every point a few levels off.
+        let noisy: [u8; super::POINTS] = std::array::from_fn(|i| 20 + (i % 5) as u8 * 3);
+        assert!(!super::shot_cut(&dark, &noisy));
+        // A fade: every point 10 levels darker per frame.
+        let mut fade = vec![[200u8; super::POINTS]];
+        while fade.last().unwrap()[0] >= 10 {
+            fade.push(fade.last().unwrap().map(|c| c - 10));
+        }
+        assert!(fade.windows(2).all(|w| !super::shot_cut(&w[0], &w[1])));
+        // Something bright moving through a few points.
+        let mut moved = dark;
+        moved[..5].fill(220);
+        assert!(!super::shot_cut(&dark, &moved));
+        // Another shot: six points or more change a lot.
+        moved[5] = 220;
+        assert!(super::shot_cut(&dark, &moved));
+        // A change of exactly 32 is not counted.
+        assert!(!super::shot_cut(&dark, &[52u8; super::POINTS]));
+    }
+
+    /// A short run: the first line has no frame length, the anchor is the
+    /// first present of 500 draws, cuts are only between frames probed one
+    /// after the other.
+    #[test]
+    #[rustfmt::skip]
+    fn frame_log_steps_latch_the_anchor_and_compare_neighbours_only() {
+        let start = std::time::Instant::now();
+        let (d, b) = (Some([10u8; super::POINTS]), Some([200u8; super::POINTS]));
+        let steps = [
+            // (frame, at ms, draws so far, levels, saved) and the line's
+            // (after_anchor, anchor_ms, frame_ms, drawn, saved, cut)
+            ((1, 0, 100, d, true), (None, None, None, 100, true, None)),
+            // 499 draws: not yet the anchor.
+            ((2, 33, 599, None, false), (None, None, Some(33.0), 499, false, None)),
+            // 500: the anchor; frame 2 was not probed, so no cut.
+            ((3, 400, 1_099, d, false), (Some(0), Some(0.0), Some(367.0), 500, false, None)),
+            // Probed after a probed frame: compared.
+            ((4, 433, 1_200, b, false), (Some(1), Some(33.0), Some(33.0), 101, false, Some(true))),
+            ((5, 466, 1_300, b, true), (Some(2), Some(66.0), Some(33.0), 100, true, Some(false))),
+            // A frame without levels, then one with: not compared with frame 5.
+            ((6, 500, 1_400, None, false), (Some(3), Some(100.0), Some(34.0), 100, false, None)),
+            ((7, 533, 1_500, d, false), (Some(4), Some(133.0), Some(33.0), 100, false, None)),
+            // Later large frames do not move the anchor.
+            ((8, 566, 9_000, None, false), (Some(5), Some(166.0), Some(33.0), 7_500, false, None)),
+            // A number skipped: not the frame before, not compared.
+            ((9, 600, 9_100, d, false), (Some(6), Some(200.0), Some(34.0), 100, false, None)),
+            ((11, 633, 9_200, b, false), (Some(8), Some(233.0), Some(33.0), 100, false, None)),
+        ];
+        let mut log = super::Log::new(start);
+        for ((frame, ms, drawn, levels, saved), want) in steps {
+            let at = start + std::time::Duration::from_millis(ms);
+            let r = log.step(frame, at, drawn, None, levels, saved);
+            assert_eq!(r.wall_ms, ms as f64, "frame {frame}");
+            let got = (r.after_anchor, r.anchor_ms, r.frame_ms, r.drawn, r.saved, r.cut);
+            assert_eq!(got, want, "frame {frame}");
+        }
+    }
+
+    /// `SCARLETT_CAPTURE_WORLD`'s frame, when known, is the anchor; with our
+    /// thread writing the lines as it shows frames, the title may have found
+    /// it a frame or more on, and the anchor waits for that frame's line.
+    #[test]
+    fn frame_log_takes_the_world_frame_as_its_anchor() {
+        let start = std::time::Instant::now();
+        let mut log = super::Log::new(start);
+        let r = log.step(9, start, 10, Some(9), None, false);
+        assert_eq!((r.after_anchor, r.anchor_ms), (Some(0), Some(0.0)));
+        let at = |ms| start + std::time::Duration::from_millis(ms);
+        // (frame, at ms, draws so far) and the line's (after_anchor, anchor_ms).
+        let few = [(7, 0, 70), (8, 33, 80), (9, 66, 90), (10, 100, 100)];
+        // 500 draws or more a line before the world frame: still that frame.
+        let many = [(7, 0, 70), (8, 33, 700), (9, 66, 720), (10, 100, 730)];
+        let want = [None, None, Some((0, 0.0)), Some((1, 34.0))];
+        for steps in [few, many] {
+            let mut log = super::Log::new(start);
+            for ((frame, ms, drawn), want) in steps.into_iter().zip(want) {
+                let r = log.step(frame, at(ms), drawn, Some(9), None, false);
+                assert_eq!(r.after_anchor.zip(r.anchor_ms), want, "frame {frame}");
+            }
+        }
+    }
+
+    /// Off unless asked for: test runs set neither switch.
+    #[test]
+    fn the_frame_log_is_off_unless_asked_for() {
+        if std::env::var_os("SCARLETT_CAPTURE").is_none()
+            || std::env::var_os("SCARLETT_CAPTURE_LOG").is_none()
+        {
+            assert!(!super::log_on());
+        }
     }
 }

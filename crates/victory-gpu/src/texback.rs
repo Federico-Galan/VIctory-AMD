@@ -4,12 +4,12 @@
 //! in the texture's host copy. The title's ocean is one: its wave passes write
 //! a 256x256 height map (R32_FLOAT) and a displacement map (R32G32_FLOAT), and
 //! its CPU code samples both, which is what boats float on; it read memory
-//! nothing had written (run rw1, `VICTORY_READ_WATCH=1`: about 30 places in
+//! nothing had written (run rw1, `SCARLETT_READ_WATCH=1`: about 30 places in
 //! the title read those two kinds), and boats sank.
 //!
-//! For textures of the kinds in `VICTORY_TEXTURE_BACK` (comma-separated
-//! `<width>x<height>f<format>`; `1` for the four water formats found by
-//! the upstream trace), a list in which shaders write one copies it
+//! For textures of the kinds in `SCARLETT_TEXTURE_BACK` (comma-separated
+//! `<width>x<height>f<format>`; unset or `1`: the four water formats found by
+//! the upstream trace; `0`: none), a list in which shaders write one copies it
 //! into a read-back buffer of ours when it closes, and once the list has run
 //! the texels are tiled into the texture's title memory in the console's
 //! layout, as the console's GPU would have left them.
@@ -31,10 +31,9 @@ fn kinds() -> &'static [(u64, u32, u32)] {
     static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
     KINDS.get_or_init(|| {
         const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
-        let list = match std::env::var("VICTORY_TEXTURE_BACK").as_deref() {
-            Ok("1") => DEFAULT.to_owned(),
+        let list = match std::env::var("SCARLETT_TEXTURE_BACK").as_deref() {
+            Ok("1") | Err(_) => DEFAULT.to_owned(),
             Ok(spec) => spec.to_owned(),
-            Err(_) => String::new(),
         };
         let kinds: Vec<(u64, u32, u32)> = list
             .split(',')
@@ -45,7 +44,7 @@ fn kinds() -> &'static [(u64, u32, u32)] {
             })
             .collect();
         if !kinds.is_empty() {
-            tracing::info!(?kinds, "textures of these kinds that shaders write are copied back into title memory (VICTORY_TEXTURE_BACK)");
+            tracing::info!(?kinds, "textures of these kinds that shaders write are copied back into title memory (SCARLETT_TEXTURE_BACK)");
         }
         kinds
     })

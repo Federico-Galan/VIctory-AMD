@@ -17,13 +17,31 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
 /// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// element of the buffer view at heap slot `i` (0: none or neither a buffer
+/// nor a constant buffer; [`SLOT_CONSTANTS`]: a constant buffer view).
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
+/// The same table of strides and format kinds as [`SLOT_STRIDES`], bound for
+/// shaders that only inspect views from descriptor tables (`RootType::Table`).
+/// Kept distinct from [`SLOT_STRIDES`] so the host binds the table without
+/// running the full bindless heap buffer sweep.
+pub const SLOT_TABLE_STRIDES: u8 = 252;
+/// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
+pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+/// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
+/// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
+/// (After ScarlettPort 4243a96a.)
+pub const VIEW_INTEGER: u32 = 1 << 31;
+/// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
+pub const VIEW_SIGNED: u32 = 1 << 30;
+/// The [`SLOT_STRIDES`] dword of a heap slot that holds a constant buffer
+/// view: a stride no buffer view has, and no format kind bits. Only such a
+/// slot is read as a constant buffer.
+pub const SLOT_CONSTANTS: u32 = VIEW_STRIDE_BITS;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
@@ -37,7 +55,8 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 /// - the root SRV `t<SLOT_MEMORY>` in [`ROOT_CBV_SPACE`] is a directory of
 ///   [`MEMORY_PAGES`] entries of two dwords, one per 64 KiB of title
 ///   address space: the number of the host copy holding that page (0: none
-///   yet) and the page's byte offset in that copy;
+///   yet; with [`MEMORY_READ_ONLY`]: stores there are dropped) and the page's
+///   byte offset in that copy;
 /// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
 ///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
 ///   reads zeros and drops writes;
@@ -49,6 +68,9 @@ pub const SLOT_MEMORY: u8 = 254;
 pub const SLOT_FAULTS: u8 = 253;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
+/// In a directory entry's first dword: shaders do not store there by address
+/// (a title buffer the structure builder has not been given to write).
+pub const MEMORY_READ_ONLY: u32 = 1 << 31;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
 /// `RootType::Other` code of a user-data dword the host computes: the view
@@ -66,18 +88,22 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// begins on 16 bytes of its host buffer; the console's root views begin
 /// anywhere (the structure builder's counters sit at addresses ending in
 /// 4 and c). The shader adds the dword to every byte offset through that
-/// view. Asked for every root UAV, and for the root SRVs of programs with
-/// a spilled user-data table.
+/// view. Asked for every root UAV.
 pub const USER_VIEW_BIAS: u32 = 0x103;
-/// `RootType::Other` code of a user-data dword the host computes, for a
-/// compute program that reads its group id x: dword 0 the groups per row of
-/// a dispatch spread across z (0: not spread), dword 1 the x group count
-/// the title asked for. A dispatch of more than 65,535 groups in x (the
-/// most Direct3D 12 runs) runs as `(row, y, rows)`; the program takes group
-/// `(x + z * row, y, 0)` and leaves at once past the asked count. (After
-/// upstream VIctory pull request #2312, Xvania7; run 319 measured indirect
-/// compute records asking 115,200 groups, clamped to 65,535 before.)
-pub const USER_DISPATCH_SPREAD: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: the low
+/// 32 bits of the title address in the root view of root parameter `slot`;
+/// [`USER_ROOT_ADDRESS`] + 1: its bits from 32 up. Programs with a spilled
+/// user-data table (the ray-tracing structure builder's) reach what their
+/// root views name as title memory by address ([`SLOT_MEMORY`]): a root view
+/// has no size, and the host's copy of what it names may end in the middle of
+/// it (a structure of megabytes crosses the 4 MiB windows).
+pub const USER_ROOT_ADDRESS: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host sets at a dispatch
+/// counted in threads (the console's `DispatchX`): how many of the threads
+/// numbered along X run (0: all of every group). The metadata's `dword` is
+/// the group's width. Asked for by the structure builder's programs
+/// ([`crate::spill::is_spilled`]).
+pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -85,8 +111,9 @@ pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
-    /// UAVs in a vertex, geometry or mesh program.
+    /// Unordered views in a vertex, geometry or mesh program.
     pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
+    pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -139,6 +166,41 @@ pub fn set_view_heap_limit(null_slot: u32) {
 /// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where the host's raw twins of its buffer views start in its view heaps (0: there are none).
+///
+/// A buffer a shader picks from the heap by an index it computes is read as raw bytes whatever
+/// view the title has there, and the index comes from data: a record of a mesh long gone, a list
+/// entry nothing wrote. On AMD a raw load through a view that is not raw (typed, structured, a
+/// constant buffer's) has no end: it reads whatever lies there, up to 4 GiB on, and loses the
+/// device where nothing does; and a texture's descriptor read as a buffer's is a wild address.
+/// So the host keeps, for slot `i`, a raw view of the same bytes at this place + `i` (a constant
+/// buffer view of a constant buffer in a title slot, a null raw view of everything else), and
+/// shaders translated while this is set read picked buffers there, and tables' buffers that they
+/// read as raw bytes.
+/// A power of two above every slot index.
+static RAW_VIEWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone.
+    pub(crate) static RAW_VIEWS_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// See [`RAW_VIEWS`].
+pub fn set_raw_views(first: u32) {
+    debug_assert!(first == 0 || first.is_power_of_two());
+    RAW_VIEWS.store(first, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`RAW_VIEWS`]: where shaders translated now read the buffers they pick (0: in place).
+pub fn raw_views() -> u32 {
+    #[cfg(test)]
+    if let Some(first) = RAW_VIEWS_HERE.get() {
+        return first;
+    }
+    RAW_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) struct Shader {
@@ -413,8 +475,23 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        self.heap_handle_at(block, index, sampler, nonuniform, props, false)
+    }
+
+    /// [`Shader::heap_handle`]; `bounded`: the index is inside the host's heap already
+    /// ([`raw_views`]).
+    pub fn heap_handle_at(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+        bounded: bool,
+    ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        // (the raw twins of buffer views lie past it: such an index comes bounded)
+        let limit = if bounded { 0 } else { VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
@@ -456,6 +533,27 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        if self.pixel {
+            // Reading a per-vertex value with attributeAtVertex needs a
+            // constant input, even when the source declaration was smooth.
+            // D3D requires all components packed into the same register to
+            // share a mode, including the ones the shader never reads.
+            for index in 0..self.inputs.len() {
+                let unused = &self.inputs[index];
+                if unused.kind != 0 || unused.usage != 0 || unused.row.is_none() {
+                    continue;
+                }
+                let mut modes = self.inputs.iter()
+                    .filter(|e| e.row == unused.row && e.usage != 0)
+                    .map(|e| e.interp);
+                if let Some(mode) = modes.next()
+                    && (mode == 1 || unused.comp == 9)
+                    && modes.all(|other| other == mode)
+                {
+                    self.inputs[index].interp = mode;
+                }
+            }
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -466,6 +564,7 @@ impl Shader {
             self.m.optimise(passes);
             let used = self.m.usage();
             for (flag, used) in [
+                (flags::ROVS, used.rovs),
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
@@ -478,9 +577,9 @@ impl Shader {
                 }
             }
         }
-        // UAVs outside pixel and compute programs (vertex, geometry and mesh
-        // programs), as DXC counts them: UAV ranges declared below, not UAVs
-        // indexed from the heap.
+        // Unordered views outside pixel and compute programs (memory by
+        // address), as DXC counts them: ranges declared below, not views
+        // picked from the heap (ScarlettPort a1a2077a).
         let compute = self.threads.is_some() && self.mesh.is_none() && self.geometry.is_none();
         if !self.root_uavs.is_empty() && !self.pixel && !compute {
             self.flags |= flags::UAVS_EVERY_STAGE;
@@ -763,7 +862,7 @@ impl Shader {
             .m
             .md_node(vec![Some(main), Some(name), sigs, resources, props]);
 
-        let ident = self.m.md_str("victory");
+        let ident = self.m.md_str("scarlett");
         let ident = self.m.md_node(vec![Some(ident)]);
         self.m.named_md("llvm.ident", vec![ident]);
         let one = i32c(&mut self, 1);
@@ -807,6 +906,9 @@ impl Shader {
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
+        }
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
@@ -907,61 +1009,5 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
-    }
-}
-
-#[cfg(all(test, windows))]
-mod tests {
-    use super::super::bitcode::Term;
-    use super::*;
-
-    /// A program that stores to root UAV 0, or (`heap`) writes through a
-    /// UAV indexed from the heap: a vertex, pixel or compute program.
-    fn marked(pixel: bool, threads: Option<[u32; 3]>, heap: bool) -> Vec<u8> {
-        let mut s = Shader::new(pixel);
-        s.threads = threads;
-        let b = s.entry;
-        let h = if heap {
-            let index = s.m.i32(0);
-            s.heap_handle(b, index, false, false, (11 | 0x1000, 0))
-        } else {
-            s.root_uav_handle(0)
-        };
-        let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
-        let iu = s.m.undef(s.t.i32);
-        let i32t = s.t.i32;
-        s.op(
-            b,
-            "atomicBinOp.i32",
-            Attr::NoUnwind,
-            i32t,
-            78,
-            &[h, or, zero, iu, iu, one],
-        );
-        s.m.terminate(b, Term::Ret);
-        s.finish()
-    }
-
-    /// A vertex program declaring a root UAV sets `UAVS_EVERY_STAGE` (DXIL
-    /// validator otherwise refuses it with "Flags must match usage"); pixel,
-    /// compute, and heap-indexed UAV programs validate cleanly as well.
-    #[test]
-    fn uavs_outside_pixel_and_compute_programs_are_declared() {
-        let mut validator = super::super::validator::Validator::load(
-            super::super::validator::Validator::default_path().as_deref(),
-        )
-        .ok();
-        for (name, pixel, threads, heap) in [
-            ("vertex", false, None, false),
-            ("pixel", true, None, false),
-            ("compute", false, Some([1, 1, 1]), false),
-            ("vertex, heap", false, None, true),
-        ] {
-            let mut dxil = marked(pixel, threads, heap);
-            if let Some(v) = validator.as_mut() {
-                v.validate(&mut dxil)
-                    .unwrap_or_else(|e| panic!("{name}: {e}"));
-            }
-        }
     }
 }

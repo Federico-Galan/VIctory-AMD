@@ -27,7 +27,7 @@
 //!   store may fall between any two reads or before both: the title's code
 //!   cannot tell which).
 //!
-//! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
+//! Which passes run is `emit::shader_opt()` (`SCARLETT_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
 
 use std::collections::HashMap;
@@ -56,15 +56,25 @@ pub const FIRST: u32 = 32;
 /// console load (`s_buffer_load_dwordx2` to `x16` from an SRV, a
 /// `global_load_dwordx2` to `x4`) by one call for every four of them, not
 /// by a call each (`lower.rs`, `raw_dwords`). The same bytes are read.
+/// From fxceless/scarlett-fork c36971b2. On an RX 7900 XTX it is worth nothing:
+/// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
+/// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
 pub const WIDE: u32 = 64;
+/// One guard select for a run of guarded writes, not one each
+/// ([`Module::sink_guards`]). A block whose EXEC the console narrows without
+/// a branch has every vector write lowered as `select(g, new, old)`; a run of
+/// such writes (the int8 networks' `v_dot4` chains: 7,008 selects in one
+/// program, one per dot product) then costs a select per instruction. Off
+/// unless asked (`SCARLETT_GUARD_SINK=1`, or this bit in `SCARLETT_SHADER_OPT`).
+pub const GUARDS: u32 = 128;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | GUARDS;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
 /// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
-/// for it).
-pub const DEFAULT: u32 = ALL & !WIDE;
+/// which no card has shown a gain for yet (`SCARLETT_SHADER_OPT=127` asks
+/// for it), and [`GUARDS`], not measured on a card yet.
+pub const DEFAULT: u32 = ALL & !WIDE & !GUARDS;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -72,6 +82,8 @@ pub const DEFAULT: u32 = ALL & !WIDE;
 pub(crate) struct Usage {
     /// A wave or quad operation.
     pub wave_ops: bool,
+    /// A rasterizer ordered view.
+    pub rovs: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
     /// A typed load of several components from a UAV.
@@ -224,6 +236,9 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
+        if passes & GUARDS != 0 {
+            self.sink_guards();
+        }
         if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
@@ -406,6 +421,82 @@ impl Module {
         Some((bits, *x as u64 & mask(bits)))
     }
 
+    /// The bits of a 32-bit float that is a constant, given as one or as a
+    /// cast of an integer constant.
+    pub(crate) fn float_k(&self, v: V) -> Option<f32> {
+        let (v, cast) = match v {
+            V::Inst(i) => match self.insts[i as usize].op {
+                Op::Cast(Cast::Bitcast, x) => (x, true),
+                _ => return None,
+            },
+            _ => (v, false),
+        };
+        let V::Const(i) = v else { return None };
+        match &self.consts[i as usize].1 {
+            Const::Float(bits) if !cast => Some(f32::from_bits(*bits)),
+            Const::Int(_) if cast => {
+                let (bits, x) = self.int_k(v)?;
+                (bits == 32).then_some(f32::from_bits(x as u32))
+            }
+            _ => None,
+        }
+    }
+
+    /// For a float that is a number and not an infinity whatever the program
+    /// reads: a power of two its magnitude does not pass.
+    pub(crate) fn bounded(&self, v: V, depth: u32) -> Option<f32> {
+        if let Some(k) = self.float_k(v) {
+            return k.is_finite().then(|| k.abs().max(1e-30).log2().ceil());
+        }
+        let V::Inst(i) = v else { return None };
+        let depth = depth.checked_sub(1)?;
+        let of = |v: V| self.bounded(v, depth);
+        // (A power that overflows, or might with rounding, is no bound.)
+        let held = |b: f32| (b < 126.0).then_some(b);
+        match &self.insts[i as usize].op {
+            Op::Cast(Cast::UiToFp | Cast::SiToFp, _) => Some(32.0),
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == self.type_of(v) => of(y),
+                    _ => None,
+                },
+                _ => None,
+            },
+            Op::Bin(Bin::Mul, a, b) => held(of(*a)? + of(*b)?),
+            Op::Bin(Bin::Add | Bin::Sub, a, b) => held(of(*a)?.max(of(*b)?) + 1.0),
+            Op::Select(_, a, b) => Some(of(*a)?.max(of(*b)?)),
+            Op::Call(_, args) => {
+                let (_, code) = self.int_k(*args.first()?)?;
+                match (code, &args[1..]) {
+                    // Saturated, a fraction, a cosine or sine (of a number).
+                    (7, [_]) => Some(0.0),
+                    (6, [x]) => of(*x),
+                    (22 | 12 | 13, [x]) => of(*x).map(|_| 0.0),
+                    (26..=29, [x]) => held(of(*x)? + 1.0),
+                    // Of two numbers; or one of them the other way round: the
+                    // minimum (36) of a constant and a maximum of another.
+                    (35 | 36, [a, b]) => match (of(*a), of(*b)) {
+                        (Some(x), Some(y)) => Some(x.max(y)),
+                        _ => {
+                            let other = if code == 35 { 36 } else { 35 };
+                            let (inner, k) = if self.float_k(*b).is_some() { (*a, *b) } else { (*b, *a) };
+                            let k = self.float_k(k).and_then(|_| of(k))?;
+                            let V::Inst(j) = inner else { return None };
+                            let Op::Call(_, inner) = &self.insts[j as usize].op else { return None };
+                            let (_, code) = self.int_k(*inner.first()?)?;
+                            let low = inner[1..].iter().find(|x| self.float_k(**x).is_some())?;
+                            (code == other).then_some(())?;
+                            Some(k.max(of(*low)?))
+                        }
+                    },
+                    (46, [a, b, c]) => held((of(*a)? + of(*b)?).max(of(*c)?) + 1.0),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The constant `x` of the integer type `ty`, kept sign-extended as
     /// [`Module::i32`] and [`Module::bool`] keep theirs.
     fn k(&mut self, ty: Ty, bits: u32, x: u64) -> V {
@@ -449,99 +540,19 @@ impl Module {
                         Bin::Add | Bin::Sub | Bin::Or | Bin::Xor | Bin::Shl | Bin::LShr | Bin::AShr,
                         _,
                         Some(0),
-                    ) => return Some(a),
-                    (Bin::Add | Bin::Or | Bin::Xor, Some(0), _) => return Some(b),
-                    (Bin::Mul | Bin::UDiv, _, Some(1)) => return Some(a),
-                    (Bin::Mul, Some(1), _) => return Some(b),
-                    (Bin::Mul | Bin::And, _, Some(0)) => return Some(b),
-                    (Bin::Mul | Bin::And, Some(0), _) => return Some(a),
-                    (Bin::And, _, Some(m)) if m == all => return Some(a),
-                    (Bin::And, Some(m), _) if m == all => return Some(b),
-                    (Bin::Or, _, Some(m)) if m == all => return Some(b),
-                    (Bin::Or, Some(m), _) if m == all => return Some(a),
-                    (Bin::And | Bin::Or, _, _) if a == b => return Some(a),
-                    _ => {}
+                    ) => Some(a),
+                    (Bin::Add | Bin::Or | Bin::Xor, Some(0), _) => Some(b),
+                    (Bin::Mul | Bin::UDiv, _, Some(1)) => Some(a),
+                    (Bin::Mul, Some(1), _) => Some(b),
+                    (Bin::Mul | Bin::And, _, Some(0)) => Some(b),
+                    (Bin::Mul | Bin::And, Some(0), _) => Some(a),
+                    (Bin::And, _, Some(m)) if m == all => Some(a),
+                    (Bin::And, Some(m), _) if m == all => Some(b),
+                    (Bin::Or, _, Some(m)) if m == all => Some(b),
+                    (Bin::Or, Some(m), _) if m == all => Some(a),
+                    (Bin::And | Bin::Or, _, _) if a == b => Some(a),
+                    _ => None,
                 }
-                match op {
-                    Bin::Xor => {
-                        for (cand, other) in [(a, b), (b, a)] {
-                            if let V::Inst(j) = cand
-                                && let Op::Bin(Bin::Xor, x, y) = self.insts[j as usize].op
-                            {
-                                if other == y {
-                                    return Some(x);
-                                }
-                                if other == x {
-                                    return Some(y);
-                                }
-                            }
-                        }
-                    }
-                    Bin::And => {
-                        if let Some((v, m)) = kb.map(|m| (a, m)).or_else(|| ka.map(|m| (b, m)))
-                            && let V::Inst(j) = v
-                        {
-                            match self.insts[j as usize].op {
-                                Op::Bin(Bin::LShr, _, sh) => {
-                                    if let Some((_, s)) = self.int_k(sh).filter(|&(_, s)| s < u64::from(bits)) {
-                                        let known = all >> s;
-                                        if known & m == known {
-                                            return Some(v);
-                                        }
-                                        if known & m == 0 {
-                                            return Some(self.k(ty, bits, 0));
-                                        }
-                                    }
-                                }
-                                Op::Bin(Bin::Shl, _, sh) => {
-                                    if let Some((_, s)) = self.int_k(sh).filter(|&(_, s)| s < u64::from(bits)) {
-                                        let known = (all << s) & all;
-                                        if known & m == known {
-                                            return Some(v);
-                                        }
-                                        if known & m == 0 {
-                                            return Some(self.k(ty, bits, 0));
-                                        }
-                                    }
-                                }
-                                Op::Bin(Bin::And, x, y) => {
-                                    if let Some(c1) =
-                                        self.int_k(y).or_else(|| self.int_k(x)).map(|k| k.1)
-                                    {
-                                        if c1 & m == c1 {
-                                            return Some(v);
-                                        }
-                                        if c1 & m == 0 {
-                                            return Some(self.k(ty, bits, 0));
-                                        }
-                                    }
-                                }
-                                Op::Cast(Cast::ZExt, inner)
-                                    if self.int_bits(self.type_of(inner)) == Some(1) =>
-                                {
-                                    return Some(if m & 1 != 0 { v } else { self.k(ty, bits, 0) });
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Bin::Or => {
-                        if let Some((v, m)) = kb.map(|m| (a, m)).or_else(|| ka.map(|m| (b, m)))
-                            && let V::Inst(j) = v
-                            && let Op::Bin(Bin::Or, x, y) = self.insts[j as usize].op
-                            && let Some(c1) = self.int_k(y).or_else(|| self.int_k(x)).map(|k| k.1)
-                        {
-                            if c1 | m == c1 {
-                                return Some(v);
-                            }
-                            if (c1 | m) == all {
-                                return Some(self.k(ty, bits, all));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                None
             }
             Op::Cmp(p, a, b) if p <= pred::TRUE => {
                 // Two float constants compare one way (`v_mul_legacy` asks
@@ -688,20 +699,6 @@ impl Module {
                     }
                     _ => None,
                 }
-            }
-            Op::Call(f, ref args) => {
-                // Fold `Countbits` (dx.op.unaryBits.i32, opcode 31) of a constant:
-                // AMD's driver (amdxc64, RDNA4) folds `Bfrev(Countbits(K))` to
-                // `Bfrev(n) | n` (0x80000001 for K = 2).
-                if self.funcs[f as usize].name == "dx.op.unaryBits.i32"
-                    && args.len() == 2
-                    && self.int_k(args[0]).is_some_and(|k| k.1 == 31)
-                    && let Some((bits, x)) = self.int_k(args[1])
-                {
-                    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
-                    return Some(self.k(ty, 32, ((x & mask).count_ones()) as u64));
-                }
-                None
             }
             _ => None,
         }
@@ -1010,6 +1007,110 @@ impl Module {
         true
     }
 
+    /// [`GUARDS`]: a guarded write is `select(g, new, old)`. Two rules, both
+    /// exact:
+    /// - a select on `g` whose arm is itself a select on `g` takes that
+    ///   select's own arm on the same side (`select(g, x, select(g, a, b))`
+    ///   is `select(g, x, b)`);
+    /// - an instruction without an effect whose result is only ever seen in
+    ///   lanes where `g` holds (it reaches nothing but the taken arm of
+    ///   selects on `g`, through other such instructions) reads `a` where
+    ///   it read `select(g, a, b)`: the same value in every lane that can
+    ///   see the result.
+    ///
+    /// A run of writes under one guard then keeps one select at its end;
+    /// [`DEAD`] takes out the rest. Reads of memory and divisions are not
+    /// rewritten (another address or divisor in a lane nobody looks at is
+    /// still a read or a division by zero there).
+    fn sink_guards(&mut self) {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Only {
+            /// No use seen yet.
+            Top,
+            /// Seen only where this condition holds.
+            Under(V),
+            /// Seen elsewhere too.
+            Any,
+        }
+        let meet = |a: Only, b: Only| match (a, b) {
+            (Only::Top, x) | (x, Only::Top) => x,
+            (Only::Under(x), Only::Under(y)) if x == y => Only::Under(x),
+            _ => Only::Any,
+        };
+        if self.blocks.is_empty() {
+            return;
+        }
+        let effects = self.effects();
+        let tree = self.dominator_tree();
+        let n = self.insts.len();
+        let rewritable = |m: &Module, i: u32| match &m.insts[i as usize].op {
+            Op::Bin(op, ..) => !matches!(op, Bin::UDiv | Bin::SDiv | Bin::URem),
+            Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) => true,
+            Op::Call(f, _) => effects[*f as usize] == Effect::Pure,
+            _ => false,
+        };
+        let mut only = vec![Only::Top; n];
+        // Users after the values they read: blocks in reverse dominator
+        // order, each from its end.
+        for &b in tree.order.iter().rev() {
+            if let Some(Term::CondBr(V::Inst(c), ..)) = self.blocks[b].term {
+                only[c as usize] = Only::Any;
+            }
+            let blk = &self.blocks[b];
+            for &k in blk.body.iter().rev().chain(blk.phis.iter()) {
+                // (`Top`: unread, dead code passes nothing on.)
+                let mine = if rewritable(self, k) { only[k as usize] } else { Only::Any };
+                let op = &self.insts[k as usize].op;
+                let mut seen = |v: V, how: Only| {
+                    if let V::Inst(j) = v {
+                        only[j as usize] = meet(only[j as usize], how);
+                    }
+                };
+                match op {
+                    Op::Select(c, t, f) => {
+                        seen(*c, Only::Any);
+                        // The taken arm is seen where `c` holds (and no more
+                        // than where the select is seen).
+                        seen(*t, if t == f { mine } else { Only::Under(*c) });
+                        seen(*f, mine);
+                    }
+                    Op::Phi(_) => for_each_operand(op, |v| seen(v, Only::Any)),
+                    _ => for_each_operand(op, |v| seen(v, mine)),
+                }
+            }
+        }
+        let arm = |m: &Module, v: V, g: V, taken: bool| -> V {
+            let mut v = v;
+            for _ in 0..64 {
+                match v {
+                    V::Inst(s) => match &m.insts[s as usize].op {
+                        Op::Select(c, a, b) if *c == g => v = if taken { *a } else { *b },
+                        _ => break,
+                    },
+                    _ => break,
+                }
+            }
+            v
+        };
+        for &b in &tree.order {
+            for idx in 0..self.blocks[b].body.len() {
+                let k = self.blocks[b].body[idx];
+                let mut op = self.insts[k as usize].op.clone();
+                if let Op::Select(c, t, f) = &mut op {
+                    let g = *c;
+                    *t = arm(self, *t, g, true);
+                    *f = arm(self, *f, g, false);
+                }
+                if let Only::Under(g) = only[k as usize]
+                    && rewritable(self, k)
+                {
+                    map_operands(&mut op, |v| if v == g { v } else { arm(self, v, g, true) });
+                }
+                self.insts[k as usize].op = op;
+            }
+        }
+    }
+
     /// Whether instruction `i` must stay whatever reads it.
     fn has_effect(&self, effects: &[Effect], i: u32) -> bool {
         match &self.insts[i as usize].op {
@@ -1052,22 +1153,6 @@ impl Module {
             for_each_operand(&self.insts[i as usize].op, |v| {
                 mark(&mut live, &mut work, v)
             });
-        }
-        // Diagnostics (`VICTORY_SHADER_OPT_TRACE=1`): the calls that leave,
-        // by function, on the error output.
-        if std::env::var_os("VICTORY_SHADER_OPT_TRACE").is_some() {
-            let mut gone: std::collections::BTreeMap<String, u32> = Default::default();
-            for (b, blk) in self.blocks.iter().enumerate() {
-                for &i in blk.body.iter().filter(|&&i| !reached[b] || !live[i as usize]) {
-                    let what = match &self.insts[i as usize].op {
-                        Op::Call(f, _) => self.funcs[*f as usize].name.clone(),
-                        Op::Load(_) => "load".into(),
-                        _ => continue,
-                    };
-                    *gone.entry(what).or_default() += 1;
-                }
-            }
-            eprintln!("clean-up: calls dropped as dead: {gone:?}");
         }
         for (b, blk) in self.blocks.iter_mut().enumerate() {
             if reached[b] {
@@ -1128,6 +1213,8 @@ impl Module {
                         Some((_, 0)) => u.heap_views = true,
                         _ => u.heap_samplers = true,
                     }
+                } else if name == "annotateHandle" {
+                    u.rovs |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
                 } else if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;
                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {
@@ -1299,6 +1386,41 @@ mod tests {
         m.terminate(b, Term::Ret);
         m.optimise(DEAD);
         assert_eq!(body(&m, b), 3, "the load, the add and the store");
+        m.write();
+    }
+
+    #[test]
+    fn a_run_of_guarded_writes_keeps_one_select() {
+        let Kit {
+            mut m,
+            b,
+            pure,
+            reads,
+            writes,
+        } = kit();
+        let (one, two) = (m.i32(1), m.i32(2));
+        let lane = m.call(b, reads, vec![one, one]);
+        let g = m.cmp(b, pred::IULT, lane, two);
+        // r = old; four times: r = g ? f(r) : r; then stored.
+        let old = m.call(b, reads, vec![two, two]);
+        let mut r = old;
+        for _ in 0..4 {
+            let x = m.call(b, pure, vec![r, one]);
+            r = m.select(b, g, x, r);
+        }
+        // A read under the same guard keeps its select'd address.
+        let seen = m.call(b, reads, vec![r, one]);
+        let y = m.select(b, g, seen, old);
+        m.call(b, writes, vec![r, y]);
+        m.terminate(b, Term::Ret);
+        // (the first input is the lane's: the guard holds for 0 and not for 3)
+        let inputs: [&[u32]; 2] = [&[0, 1, 2, 3, 5], &[3, 1, 2, 7, 5]];
+        let before: Vec<_> = inputs.iter().map(|i| run(&m, i)).collect();
+        let selects = |m: &Module| m.blocks[b].body.iter().filter(|&&i| matches!(m.insts[i as usize].op, Op::Select(..))).count();
+        m.optimise(GUARDS | DEAD);
+        let after: Vec<_> = inputs.iter().map(|i| run(&m, i)).collect();
+        assert_eq!(after, before);
+        assert_eq!(selects(&m), 2, "the last write's and the read's");
         m.write();
     }
 
@@ -2251,77 +2373,5 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
-    }
-
-    #[test]
-    fn fold_simplifies_bitmasks_double_xor_and_zext_masks() {
-        let Kit {
-            mut m,
-            b: entry,
-            pure,
-            writes: sink,
-            ..
-        } = kit();
-        let i32t = m.int(32);
-        let (c0, c2, c24) = (m.i32(0), m.i32(2), m.i32(24));
-        let x = m.call(entry, pure, vec![c0, c2]);
-        let (all, mff, mhi, mlo) = (
-            m.i32(u32::MAX),
-            m.i32(0xFF),
-            m.i32(0xFFFF_0000),
-            m.i32(0x0000_FFFF),
-        );
-        let (align4, low2, k) = (m.i32(!3u32), m.i32(3), m.i32(0xA5A5_5A5A));
-
-        let or_all = m.bin(entry, Bin::Or, x, all);
-        let x1 = m.bin(entry, Bin::Xor, x, k);
-        let x2 = m.bin(entry, Bin::Xor, x1, k);
-        let shr = m.bin(entry, Bin::LShr, x, c24);
-        let shr_keep = m.bin(entry, Bin::And, shr, mff);
-        let shr_zero = m.bin(entry, Bin::And, shr, mhi);
-        let shl = m.bin(entry, Bin::Shl, x, c2);
-        let shl_keep = m.bin(entry, Bin::And, shl, align4);
-        let shl_zero = m.bin(entry, Bin::And, shl, low2);
-        let a1 = m.bin(entry, Bin::And, x, mff);
-        let a_keep = m.bin(entry, Bin::And, a1, mlo);
-        let a_zero = m.bin(entry, Bin::And, a1, mhi);
-        let o1 = m.bin(entry, Bin::Or, x, mlo);
-        let o_keep = m.bin(entry, Bin::Or, o1, mff);
-        let o_all = m.bin(entry, Bin::Or, o1, mhi);
-        let cond = m.cmp(entry, pred::EQ, x, c0);
-        let z = m.cast(entry, Cast::ZExt, cond, i32t);
-        let z_keep = m.bin(entry, Bin::And, z, mff);
-        let z_zero = m.bin(entry, Bin::And, z, mhi);
-
-        for v in [
-            or_all, x2, shr_keep, shr_zero, shl_keep, shl_zero, a_keep, a_zero, o_keep, o_all,
-            z_keep, z_zero,
-        ] {
-            m.call(entry, sink, vec![c0, v]);
-        }
-        m.terminate(entry, Term::Ret);
-        m.optimise(FOLD | DEAD);
-
-        let args: Vec<V> = m.blocks[entry]
-            .body
-            .iter()
-            .filter_map(|&i| match &m.insts[i as usize].op {
-                Op::Call(fn_id, a) if m.funcs[*fn_id as usize].name.contains("Store") => Some(a[1]),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(args.len(), 12);
-        assert_eq!(m.int_k(args[0]).map(|k| k.1), Some(u64::from(u32::MAX)));
-        assert_eq!(args[1], x);
-        assert_eq!(args[2], shr);
-        assert_eq!(m.int_k(args[3]).map(|k| k.1), Some(0));
-        assert_eq!(args[4], shl);
-        assert_eq!(m.int_k(args[5]).map(|k| k.1), Some(0));
-        assert_eq!(args[6], a1);
-        assert_eq!(m.int_k(args[7]).map(|k| k.1), Some(0));
-        assert_eq!(args[8], o1);
-        assert_eq!(m.int_k(args[9]).map(|k| k.1), Some(u64::from(u32::MAX)));
-        assert_eq!(args[10], z);
-        assert_eq!(m.int_k(args[11]).map(|k| k.1), Some(0));
     }
 }

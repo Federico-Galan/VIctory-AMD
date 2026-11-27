@@ -396,65 +396,20 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
-    #[cfg(windows)]
-    if let Some(dir) = std::env::var_os("VICTORY_NATIVE_PSO_DUMP") {
-        dump_native(SLOT, desc as usize, std::path::Path::new(&dir));
-    }
     E_NOTIMPL
 }
 
-/// `VICTORY_NATIVE_PSO_DUMP=<dir>` (diagnostics; off unless set): the blobs
-/// a 0x1c8 / 0x218 description names, once per description key (0x218: its
-/// word 11, a 64-bit hash; 0x1c8: the code pointers of words 5 and 9).
-/// Files: `<dir>/<slot>_<key>/desc.bin` (the first 0x80 bytes), `root.bin`
-/// (0x80 bytes at word 0), `w<i>_<size>.bin` for each (pointer, size) pair
-/// at words (1,2) (3,4) (5,6) (7,8) (9,10) (11,12), and `p9.bin` /
-/// `p10.bin` (0x100 bytes at 0x218's two unsized pointers). Everything is
-/// read through the kernel (`host::read_into`): an unmapped pointer is
-/// skipped, never touched.
-#[cfg(windows)]
-fn dump_native(slot: usize, desc: usize, dir: &std::path::Path) {
-    use std::sync::Mutex;
-    static SEEN: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
-    let read = |at: usize, n: usize| -> Option<Vec<u8>> {
-        let mut b = vec![0u8; n];
-        (at != 0 && n <= 1 << 20 && crate::host::read_into(at as *const u8, &mut b)).then_some(b)
-    };
-    let Some(d) = read(desc, 0x80) else {
-        return;
-    };
-    let w = |i: usize| u64::from_le_bytes(d[8 * i..8 * i + 8].try_into().unwrap_or([0; 8]));
-    let key = if slot == 0x218 { w(11) } else { w(5) ^ (w(9) << 1) };
-    {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.contains(&(slot, key)) || seen.len() >= 4096 {
-            return;
-        }
-        seen.push((slot, key));
-    }
-    let sub = dir.join(format!("{slot:x}_{key:016x}"));
-    let _ = std::fs::create_dir_all(&sub);
-    let _ = std::fs::write(sub.join("desc.bin"), &d);
-    if let Some(r) = read(w(0) as usize, 0x80) {
-        let _ = std::fs::write(sub.join("root.bin"), r);
-    }
-    let pairs: &[usize] = if slot == 0x218 { &[1, 3, 5, 7] } else { &[1, 3, 5, 7, 9, 11] };
-    for &i in pairs {
-        let (at, size) = (w(i) as usize, w(i + 1) as usize);
-        if at == 0 || size == 0 || size > 1 << 20 {
-            continue;
-        }
-        if let Some(b) = read(at, size) {
-            let _ = std::fs::write(sub.join(format!("w{i}_{size:x}.bin")), b);
+/// The host device's state: the console's device is removed when the host's is
+/// (ScarlettPort 13185f5: the default answer, E_NOTIMPL, reads as a lost device).
+extern "system" fn removed_reason(_: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        // SAFETY: a plain query.
+        if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
+            return e.code().0;
         }
     }
-    if slot == 0x218 {
-        for i in [9usize, 10] {
-            if let Some(b) = read(w(i) as usize, 0x100) {
-                let _ = std::fs::write(sub.join(format!("p{i}.bin")), b);
-            }
-        }
-    }
+    S_OK
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
@@ -489,6 +444,7 @@ static FUNCTIONS: Table<160> = {
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
     f[36] = fence::create as *const (); // 0x120
+    f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148

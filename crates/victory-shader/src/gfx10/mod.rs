@@ -57,21 +57,15 @@ pub struct Instruction {
     /// Every dword of the instruction, including literals and extra dwords.
     pub words: Vec<u32>,
     /// [`name`] of `encoding` and `opcode`, resolved once at decode time.
-    /// The translator asks about every instruction multiple times; the table
-    /// is a binary search.
+    /// The translator asks about every instruction eight times; the table is
+    /// a binary search.
     name: Option<&'static str>,
 }
 
 impl Instruction {
-    /// Builds an instruction and resolves its mnemonic once at decode time.
-    pub(crate) fn new(offset: usize, encoding: Encoding, opcode: u16, words: Vec<u32>) -> Self {
-        Self {
-            offset,
-            encoding,
-            opcode,
-            words,
-            name: name(encoding, opcode),
-        }
+    /// An instruction of these words, its name resolved.
+    pub fn new(offset: usize, encoding: Encoding, opcode: u16, words: Vec<u32>) -> Self {
+        Self { offset, encoding, opcode, words, name: name(encoding, opcode) }
     }
 
     /// AMD's name for the opcode, if it is in our table.
@@ -297,12 +291,14 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
             _ => return Err(isa(offset, "unknown encoding")),
         }
     };
-    Ok(Instruction::new(
+    let opcode = opcode as u16;
+    Ok(Instruction {
         offset,
         encoding,
-        opcode as u16,
-        (0..len).map(word).collect::<Result<_, _>>()?,
-    ))
+        opcode,
+        words: (0..len).map(word).collect::<Result<_, _>>()?,
+        name: name(encoding, opcode),
+    })
 }
 
 fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
@@ -365,6 +361,21 @@ mod tests {
             .iter()
             .map(|i| (i.offset, i.words.len(), i.name().unwrap_or("?")))
             .collect()
+    }
+
+    #[test]
+    fn flat_offsets_ignore_bit_eleven() {
+        let offset = |word0: u32| {
+            let code = bytes(&[word0, 0x0000_0001, S_ENDPGM]);
+            match decode(&code).unwrap()[0].fields(false) {
+                Fields::Flat { offset, .. } => offset,
+                fields => panic!("{fields:?}"),
+            }
+        };
+        // flat_load_dword v0, v[1:2]: the FLAT offset is 11-bit and
+        // unsigned, so bit 11 is ignored (0x800 -> 0, 0xfff -> 0x7ff).
+        assert_eq!(offset(0xDC30_0800), 0);
+        assert_eq!(offset(0xDC30_0FFF), 0x7FF);
     }
 
     #[test]

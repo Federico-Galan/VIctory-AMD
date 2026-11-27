@@ -63,7 +63,7 @@ impl ImportResolver for TestResolver {
                 Some(fake_xgameruntime_initialize as *const () as usize)
             }
             ("kernel32.dll", "GetTickCount") => Some(fake_get_tick_count as *const () as usize),
-            ("victory-probe-delayed.dll", "VIctoryProbeDelayed") => {
+            ("scarlett-probe-delayed.dll", "ScarlettPortProbeDelayed") => {
                 Some(fake_delayed as *const () as usize)
             }
             _ => None,
@@ -113,7 +113,7 @@ fn loads_binds_and_calls_probe() {
         "{imports:?}"
     );
     assert!(
-        imports.contains(&"victory-probe-missing.dll".to_owned()),
+        imports.contains(&"scarlett-probe-missing.dll".to_owned()),
         "{imports:?}"
     );
     assert!(
@@ -121,25 +121,25 @@ fn loads_binds_and_calls_probe() {
             .info
             .delay_imports
             .iter()
-            .any(|m| m.dll.eq_ignore_ascii_case("victory-probe-delayed.dll")),
-        "fixture must delay-load victory-probe-delayed.dll"
+            .any(|m| m.dll.eq_ignore_ascii_case("scarlett-probe-delayed.dll")),
+        "fixture must delay-load scarlett-probe-delayed.dll"
     );
 
     let dir = tempfile::tempdir().unwrap();
     let image = victory_loader::load(&prepared, dir.path()).unwrap();
 
-    // The "title" ships victory-probe-title.dll: any real DLL will do.
+    // The "title" ships scarlett-probe-title.dll: any real DLL will do.
     let title_dir = tempfile::tempdir().unwrap();
     std::fs::copy(
         r"C:\Windows\System32\version.dll",
-        title_dir.path().join("victory-probe-title.dll"),
+        title_dir.path().join("scarlett-probe-title.dll"),
     )
     .unwrap();
     let dlls =
         victory_loader::load_title_dlls(image.info(), title_dir.path(), dir.path(), &|_| true)
             .unwrap();
     let names: Vec<_> = dlls.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["victory-probe-title.dll"]);
+    assert_eq!(names, ["scarlett-probe-title.dll"]);
     let resolver = WithTitleDlls {
         inner: &TestResolver,
         dlls: &dlls,
@@ -158,7 +158,7 @@ fn loads_binds_and_calls_probe() {
     assert_eq!(report.hle, 3);
     assert!(report.host > 0);
     assert_eq!(report.missing.len(), 1);
-    assert_eq!(report.missing[0].symbol, "VIctoryProbeNotImplemented");
+    assert_eq!(report.missing[0].symbol, "ScarlettPortProbeNotImplemented");
 
     let call = |name: &str| -> usize { image.export(name).unwrap_or_else(|| panic!("{name}")) };
     // SAFETY: the exports have the signatures declared in the fixture and

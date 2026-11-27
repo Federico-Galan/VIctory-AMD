@@ -47,7 +47,7 @@
 //! one layer, more than one level, of [`floor`] bytes or more, whose memory
 //! is not all its own when the host copy is made (`resource.rs` `hosted`);
 //! every other texture is made as before. Off unless
-//! `VICTORY_LEVELS_ON_DEMAND=1`.
+//! `SCARLETT_LEVELS_ON_DEMAND=1`.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -72,13 +72,13 @@ const HEAP_TILES: u32 = 1024;
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 /// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
+/// (`SCARLETT_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
 /// tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        if !std::env::var_os("SCARLETT_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
             return false;
         }
         let Some(host) = host() else {
@@ -99,7 +99,7 @@ pub(crate) fn wanted() -> bool {
             tier,
             on,
             floor_kb = floor() >> 10,
-            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
+            "host copies of title textures take the card's memory level by level (SCARLETT_LEVELS_ON_DEMAND=1)"
         );
         on
     })
@@ -112,12 +112,12 @@ fn parse_floor(value: Option<&str>) -> u64 {
 }
 
 /// The bytes from which a texture is made this way: a megabyte, or
-/// `VICTORY_LEVELS_MIN_KB`. (The accounting of run 189: the levels not
+/// `SCARLETT_LEVELS_MIN_KB`. (The accounting of run 189: the levels not
 /// held are 1.9 MB a copy on some 1,600 copies; a 512x512 texture has six
 /// tiles at most, and most of the calls for nothing.)
 pub(crate) fn floor() -> u64 {
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| parse_floor(std::env::var("VICTORY_LEVELS_MIN_KB").ok().as_deref()))
+    *BYTES.get_or_init(|| parse_floor(std::env::var("SCARLETT_LEVELS_MIN_KB").ok().as_deref()))
 }
 
 /// The bytes of the tiles given to textures now: the card's memory they
@@ -648,13 +648,13 @@ impl Drop for Tiled {
 /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
 /// before `first` of a texture of `levels` levels: it starts at `first` if
 /// it started before it, shows as many levels fewer (clamped to the
-/// remaining levels). `ResourceMinLODClamp` is measured from mip 0 of the
-/// resource, so moving the start of the view preserves that field.
+/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
+/// the effective minimum LOD stays at the same resource level.
 pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
     if first >= levels {
         return;
     }
-    let clamp = |most: &mut u32, mips: &mut u32| {
+    let clamp = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
         if first <= *most {
             return;
         }
@@ -663,17 +663,20 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
         if *mips != u32::MAX {
             *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
         }
+        if *min_lod > 0.0 {
+            *min_lod = (*min_lod - fewer as f32).max(0.0);
+        }
     };
     match desc.ViewDimension {
         D3D12_SRV_DIMENSION_TEXTURE2D => {
             // SAFETY: `ViewDimension` selects `Texture2D`.
             let view = unsafe { &mut desc.Anonymous.Texture2D };
-            clamp(&mut view.MostDetailedMip, &mut view.MipLevels);
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
         }
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
             // SAFETY: `ViewDimension` selects `Texture2DArray`.
             let view = unsafe { &mut desc.Anonymous.Texture2DArray };
-            clamp(&mut view.MostDetailedMip, &mut view.MipLevels);
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
         }
         _ => {}
     }
@@ -720,7 +723,7 @@ pub(crate) fn status() {
 /// Run by name, alone, no game needed:
 /// `cargo test -p victory-gpu --release -- --ignored levels_on_demand --nocapture`
 ///
-/// It runs on the SOFTWARE adapter unless `VICTORY_TILES_TEST_CARD=1`: on
+/// It runs on the SOFTWARE adapter unless `SCARLETT_TILES_TEST_CARD=1`: on
 /// that adapter nothing reaches the card or its driver, so nothing it does
 /// can reset the driver or touch the screen. Wherever it runs, the debug
 /// layer is switched on if Windows has it (the optional feature "Graphics
@@ -789,12 +792,12 @@ void look() {
 
     impl Rig {
         /// The software adapter, or the default one with
-        /// `VICTORY_TILES_TEST_CARD=1`; `None` without one, without tiled
+        /// `SCARLETT_TILES_TEST_CARD=1`; `None` without one, without tiled
         /// resources of tier 2, or on the card without the debug layer.
         fn new() -> Option<Rig> {
             // SAFETY: plain object creation on a device of our own.
             unsafe {
-                let card = std::env::var_os("VICTORY_TILES_TEST_CARD").is_some_and(|v| v == "1");
+                let card = std::env::var_os("SCARLETT_TILES_TEST_CARD").is_some_and(|v| v == "1");
                 // The debug layer, before the device is made: a call that
                 // is not well formed is then refused and named by the
                 // runtime, not handed to the driver.
@@ -1432,7 +1435,7 @@ void look() {
         assert_eq!(tiled.claim(small), small);
     }
 
-    /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
+    /// On the software adapter unless `SCARLETT_TILES_TEST_CARD=1`.
     #[test]
     #[ignore = "on the card: run it by name with --ignored --nocapture"]
     fn levels_on_demand_on_the_card() {
@@ -1455,7 +1458,7 @@ void look() {
         rig.check("every step done");
         eprintln!(
             "all steps passed {}",
-            if rig.card { "ON THE CARD" } else { "on the software adapter; VICTORY_TILES_TEST_CARD=1 is the run on the card" }
+            if rig.card { "ON THE CARD" } else { "on the software adapter; SCARLETT_TILES_TEST_CARD=1 is the run on the card" }
         );
         let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
         eprintln!(
@@ -1478,7 +1481,7 @@ void look() {
     }
 
     #[test]
-    fn show_from_preserves_resource_min_lod_for_2d_and_2d_array() {
+    fn show_from_clamps_2d_and_2d_array_and_adjusts_min_lod() {
         let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -1498,7 +1501,7 @@ void look() {
         assert_eq!(v2d.MostDetailedMip, 3);
         // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
         assert_eq!(v2d.MipLevels, 8);
-        assert_eq!(v2d.ResourceMinLODClamp, 3.5);
+        assert_eq!(v2d.ResourceMinLODClamp, 0.5);
 
         let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1520,7 +1523,7 @@ void look() {
         let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
         assert_eq!(varr.MostDetailedMip, 2);
         assert_eq!(varr.MipLevels, 4);
-        assert_eq!(varr.ResourceMinLODClamp, 1.5);
+        assert_eq!(varr.ResourceMinLODClamp, 0.0);
     }
 
     #[test]

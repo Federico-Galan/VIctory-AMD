@@ -2,9 +2,9 @@
 //! translated, against the same HLSL compiled for PC, both drawn (or
 //! dispatched) on the host GPU with the same inputs.
 //!
-//! Needs `VICTORY_CONSOLE_DXC` (the console SDK's `dxc.exe`) and a PC
-//! `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's); skipped
-//! without them. Set `VICTORY_WARP=1` to draw on WARP.
+//! Needs `SCARLETT_CONSOLE_DXC` (the console SDK's `dxc.exe`) and a PC
+//! `dxc.exe` (`SCARLETT_PC_DXC`, else the newest Windows SDK's); skipped
+//! without them. Set `SCARLETT_WARP=1` to draw on WARP.
 
 use std::path::{Path, PathBuf};
 
@@ -432,7 +432,7 @@ const CS_CASES: &[(&str, &str)] = &[
     // A loop whose count comes from a view that reads zeros (as a null or
     // not yet mirrored one does) runs four billion times on the console;
     // the translation leaves it after `LOOP_LIMIT` iterations. Run on WARP
-    // only (`VICTORY_WARP=1`), ours only: without the limit it would hang
+    // only (`SCARLETT_WARP=1`), ours only: without the limit it would hang
     // the GPU.
     (
         "terminates on zero data",
@@ -652,8 +652,8 @@ const MS_CASES: &[(&str, u32, &str)] = &[
 ];
 
 fn tools() -> Option<(PathBuf, PathBuf)> {
-    let console = PathBuf::from(std::env::var_os("VICTORY_CONSOLE_DXC")?);
-    let pc = match std::env::var_os("VICTORY_PC_DXC") {
+    let console = PathBuf::from(std::env::var_os("SCARLETT_CONSOLE_DXC")?);
+    let pc = match std::env::var_os("SCARLETT_PC_DXC") {
         Some(p) => PathBuf::from(p),
         None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
     };
@@ -679,7 +679,7 @@ fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec
         // `CONSOLE` marks the console compile (cases spell console-only
         // intrinsics there).
         .args(
-            std::env::var_os("VICTORY_CONSOLE_DXC")
+            std::env::var_os("SCARLETT_CONSOLE_DXC")
                 .is_some_and(|c| Path::new(&c) == dxc)
                 .then_some("-DCONSOLE"),
         )
@@ -718,11 +718,14 @@ fn translated_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
-    let dir = std::env::temp_dir().join(format!("victory-diff-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("scarlett-diff-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let texels: Vec<[f32; 4]> = (0..16)
@@ -772,7 +775,7 @@ fn translated_shaders_draw_as_pc_ones() {
         mesh_groups: 0,
     };
     let mut failures = Vec::new();
-    let only = std::env::var("VICTORY_DIFF_ONLY").ok();
+    let only = std::env::var("SCARLETT_DIFF_ONLY").ok();
     for (name, src) in CASES
         .iter()
         .filter(|c| only.as_ref().is_none_or(|o| o == c.0))
@@ -787,7 +790,7 @@ fn translated_shaders_draw_as_pc_ones() {
                 continue;
             }
         };
-        if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
+        if let Ok(out) = std::env::var("SCARLETT_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
             std::fs::write(
                 format!("{out}/{stem}.ps.cdxil"),
@@ -874,11 +877,14 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
-    let dir = std::env::temp_dir().join(format!("victory-diff-ms-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("scarlett-diff-ms-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let draw = |roots, mesh_groups| Draw {
@@ -891,7 +897,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         mesh_groups,
     };
     let mut failures = Vec::new();
-    let only = std::env::var("VICTORY_DIFF_ONLY").ok();
+    let only = std::env::var("SCARLETT_DIFF_ONLY").ok();
     for &(name, groups, src) in MS_CASES
         .iter()
         .filter(|c| only.as_ref().is_none_or(|o| o == c.0))
@@ -905,7 +911,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             }
         };
         let ps_c = translate(&compile(&console, &dir, src, "mps", "ps_6_5")).unwrap();
-        if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
+        if let Ok(out) = std::env::var("SCARLETT_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
             std::fs::write(format!("{out}/{stem}.ms.cdxil"), &console_ms).unwrap();
             std::fs::write(format!("{out}/{stem}.ms.dxil"), &ms_c.dxil).unwrap();
@@ -991,11 +997,14 @@ fn float_semantics_are_the_consoles() {
         eprintln!("no console compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
-    let dir = std::env::temp_dir().join(format!("victory-float-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("scarlett-float-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = r#"[RootSignature(RS)] [numthreads(4, 1, 1)]
         void cs(uint i : SV_GroupIndex) {
@@ -1080,11 +1089,14 @@ fn translated_compute_matches_pc() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
-    let dir = std::env::temp_dir().join(format!("victory-diff-cs-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("scarlett-diff-cs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let texels: Vec<[f32; 4]> = (0..16)
@@ -1152,7 +1164,7 @@ fn translated_compute_matches_pc() {
             typed_view(DXGI_FORMAT_R8_UNORM, 1),
             typed_view(DXGI_FORMAT_R16_FLOAT, 2),
             typed_view(DXGI_FORMAT_R8G8B8A8_SNORM, 4),
-            View::Cube(4, &cube_texels),
+            View::Cube(4, 1, &cube_texels),
         ])
         .collect();
     let root_cbv = floats(64, -0.125);
@@ -1173,15 +1185,15 @@ fn translated_compute_matches_pc() {
         groups: [2, 2, 1],
     };
     let mut failures = Vec::new();
-    let only = std::env::var("VICTORY_DIFF_ONLY").ok();
-    let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let only = std::env::var("SCARLETT_DIFF_ONLY").ok();
+    let warp = std::env::var("SCARLETT_WARP").is_ok_and(|v| v == "1");
     for (name, src) in CS_CASES
         .iter()
         .filter(|c| only.as_ref().is_none_or(|o| o == c.0))
         .filter(|c| warp || !c.0.starts_with("terminates"))
     {
         let console_cs = compile(&console, &dir, src, "cs", "cs_6_5");
-        if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
+        if let Ok(out) = std::env::var("SCARLETT_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
             std::fs::write(format!("{out}/{stem}.cs.cdxil"), &console_cs).unwrap();
         }
@@ -1192,7 +1204,7 @@ fn translated_compute_matches_pc() {
                 continue;
             }
         };
-        if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
+        if let Ok(out) = std::env::var("SCARLETT_EMIT_DUMP") {
             let stem = name.replace([' ', ','], "_");
             std::fs::write(format!("{out}/{stem}.cs.dxil"), &cs_c.dxil).unwrap();
         }
@@ -1205,7 +1217,7 @@ fn translated_compute_matches_pc() {
         let (root_t, pso_t) = match host.compute_pipeline(&cs_c) {
             Ok(p) => p,
             // WARP runs no fixed wave size of 64.
-            Err(e) if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") => {
+            Err(e) if std::env::var("SCARLETT_WARP").is_ok_and(|v| v == "1") => {
                 eprintln!("{name}: skipped on WARP ({e})");
                 continue;
             }
@@ -1216,12 +1228,44 @@ fn translated_compute_matches_pc() {
         let mut root_views: Vec<(u8, bool)> = cs_c.root_cbvs.iter().map(|&s| (s, false)).collect();
         root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
         root_views.sort_unstable();
+        let view_strides: Vec<u32> = views
+            .iter()
+            .map(|v| match *v {
+                View::RawUav(_) => 1,
+                View::HalfUav(_) => 8,
+                View::Cbv(_) => super::SLOT_CONSTANTS,
+                View::Buffer { stride, .. } => match stride {
+                    Stride::Raw => 1,
+                    Stride::Typed => 16,
+                    Stride::Structured(s) => s,
+                    Stride::Format(f, bytes) => {
+                        let kind = match f.0 as u32 {
+                            3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => {
+                                super::VIEW_INTEGER
+                            }
+                            4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => {
+                                super::VIEW_INTEGER | super::VIEW_SIGNED
+                            }
+                            _ => 0,
+                        };
+                        bytes | kind
+                    }
+                },
+                _ => 0,
+            })
+            .collect();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
-            assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
-            let data = if srv {
-                root_srv.clone()
+            let data = if srv
+                && (slot == super::SLOT_STRIDES || slot == super::SLOT_TABLE_STRIDES)
+            {
+                view_strides.clone()
             } else {
-                root_cbv.clone()
+                assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
+                if srv {
+                    root_srv.clone()
+                } else {
+                    root_cbv.clone()
+                }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }

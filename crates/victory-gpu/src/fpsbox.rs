@@ -27,7 +27,11 @@ static TENTHS: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Whether the counter is drawn.
 fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FPS_COUNTER").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_FPS_COUNTER")
+            .or_else(|| std::env::var_os("SCARLETT_FPS_COUNTER"))
+            .is_none_or(|v| v != "0")
+    })
 }
 
 /// The frame rate just measured.
