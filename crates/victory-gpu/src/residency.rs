@@ -7,6 +7,9 @@ const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 static PRESSURED: AtomicBool = AtomicBool::new(false);
 static HEADROOM: AtomicU64 = AtomicU64::new(u64::MAX);
+static SHARED_BUDGET: AtomicU64 = AtomicU64::new(0);
+static SHARED_AVAILABLE: AtomicU64 = AtomicU64::new(u64::MAX);
+static NEXT_SHARED_SAMPLE: AtomicU64 = AtomicU64::new(0);
 
 fn memory_status() -> Option<MEMORYSTATUSEX> {
     // SAFETY: the API initializes the fields of a correctly sized structure.
@@ -55,6 +58,24 @@ fn sample_commit(now: u64) -> u64 {
     AVAILABLE_COMMIT.load(Ordering::Relaxed)
 }
 
+fn sample_shared_available(now: u64) -> u64 {
+    let next = NEXT_SHARED_SAMPLE.load(Ordering::Relaxed);
+    if now >= next
+        && NEXT_SHARED_SAMPLE
+            .compare_exchange(next, now.saturating_add(32), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        && let Some([_, _, shared_budget, shared_used]) = crate::host::host().and_then(|h| h.video_memory())
+    {
+        SHARED_BUDGET.store(shared_budget, Ordering::Relaxed);
+        SHARED_AVAILABLE.store(shared_budget.saturating_sub(shared_used), Ordering::Relaxed);
+    }
+    SHARED_AVAILABLE.load(Ordering::Relaxed)
+}
+
+fn sample_effective_reserve(now: u64) -> u64 {
+    sample_commit(now).min(sample_shared_available(now))
+}
+
 fn has_upload_reserve(commit: u64, bake: bool) -> bool {
     // Keep a protective floor against Rust/game OOM aborts without starving
     // bindless world textures or one-shot ped decoration bakes when steady-state
@@ -76,7 +97,7 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_upload_reserve(sample_commit(now), bake)
+    has_upload_reserve(sample_effective_reserve(now), bake)
 }
 
 /// Whether the staging allocator may commit a brand-new OS upload buffer
@@ -87,12 +108,23 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_growth_reserve(sample_commit(now), bake)
+    has_growth_reserve(sample_effective_reserve(now), bake)
 }
 
 pub(crate) fn limited_host_ram() -> bool {
     static LIMITED: OnceLock<bool> = OnceLock::new();
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
+}
+
+fn shared_pressure(was: bool, shared_avail: u64, shared_budget: u64) -> bool {
+    if shared_budget == 0 || shared_avail == u64::MAX {
+        return false;
+    }
+    if was {
+        shared_avail < 3 * GIB || shared_avail * 100 < shared_budget * 25
+    } else {
+        shared_avail <= 2 * GIB || shared_avail * 100 <= shared_budget * 18
+    }
 }
 
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
@@ -103,13 +135,21 @@ fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     }
 }
 
-/// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
+/// Called by the once-per-second submission sweep and on urgent OOM reclaim.
+/// A failed sample keeps the last good state.
 pub(crate) fn refresh() {
     let Some(status) = memory_status() else { return };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
-    HEADROOM.store(physical.min(commit), Ordering::Relaxed);
+    let shared = crate::host::host().and_then(|h| h.video_memory());
+    if let Some([_, _, shared_budget, shared_used]) = shared {
+        SHARED_BUDGET.store(shared_budget, Ordering::Relaxed);
+        SHARED_AVAILABLE.store(shared_budget.saturating_sub(shared_used), Ordering::Relaxed);
+    }
+    let shared_budget = SHARED_BUDGET.load(Ordering::Relaxed);
+    let shared_avail = SHARED_AVAILABLE.load(Ordering::Relaxed);
+    HEADROOM.store(physical.min(commit).min(shared_avail), Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    let pressure = next_pressure(was, physical, commit) || shared_pressure(was, shared_avail, shared_budget);
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
@@ -118,6 +158,8 @@ pub(crate) fn refresh() {
                 frame = crate::frame::current(),
                 physical_free_mib = physical >> 20,
                 available_commit_mib = commit >> 20,
+                shared_gpu_avail_mib = (shared_avail != u64::MAX).then_some(shared_avail >> 20),
+                shared_gpu_budget_mib = (shared_budget > 0).then_some(shared_budget >> 20),
                 buffer_mirror_span_mib = crate::shadow::live_span_bytes() >> 20,
                 texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
                 spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
@@ -128,6 +170,7 @@ pub(crate) fn refresh() {
             tracing::info!(
                 physical_free_mib = physical >> 20,
                 available_commit_mib = commit >> 20,
+                shared_gpu_avail_mib = (shared_avail != u64::MAX).then_some(shared_avail >> 20),
                 "host memory pressure cleared"
             );
         }
@@ -143,11 +186,11 @@ pub(crate) fn pressured() -> bool {
     PRESSURED.load(Ordering::Relaxed)
 }
 
-/// True when OS commit headroom is critically low (< 1.5 GiB) or an allocation
-/// just failed with `E_OUTOFMEMORY`, requiring emergency throttling.
+/// True when OS commit or DXGI shared GPU memory headroom is critically low
+/// (< 1.5 GiB) or an allocation just failed with `E_OUTOFMEMORY`.
 pub(crate) fn critical_commit() -> bool {
     let now = crate::host::coarse_ms();
-    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
+    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_effective_reserve(now) < 1536 * MIB
 }
 
 /// A soft per-frame admission limit. A single texture can cross it. The
@@ -201,5 +244,15 @@ mod tests {
         assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
         assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
         assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
+    }
+
+    #[test]
+    fn shared_gpu_pressure_enters_and_recovers_with_hysteresis() {
+        let budget = 11 * GIB;
+        assert!(!shared_pressure(false, 4 * GIB, budget));
+        assert!(shared_pressure(false, 2 * GIB, budget));
+        assert!(shared_pressure(false, budget * 18 / 100, budget));
+        assert!(shared_pressure(true, 2 * GIB + 512 * MIB, budget));
+        assert!(!shared_pressure(true, 3 * GIB, budget));
     }
 }

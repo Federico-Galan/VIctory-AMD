@@ -70,6 +70,9 @@
 *.7z
 *.rar
 
+# Runtime logs
+/logs/
+
 # Editor / OS noise
 .vs/
 .idea/

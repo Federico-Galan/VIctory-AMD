@@ -383,11 +383,25 @@ pub(crate) fn keep_freed() -> bool {
 /// when free physical RAM is low. Never returns less than 2,000 ms.
 /// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    if crate::residency::critical_commit() {
+        return 500;
+    }
     let effective = match (avail_phys, crate::residency::headroom()) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
     ram_idle_for(effective, keep_freed() && !crate::residency::limited_host_ram())
+}
+
+fn urgent_reclaim(error: &windows::core::Error) {
+    crate::residency::allocation_error(error);
+    crate::residency::refresh();
+    trim_spare_chunks();
+    crate::shadow::trim_snapshot_pool();
+    crate::pool::reclaim_staging_urgent();
+    crate::texture::let_go_idle();
+    crate::shadow::let_go_idle();
+    crate::pipeline::trim_library();
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -4154,9 +4168,9 @@ impl Host {
 
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
-        // SAFETY: plain object creation.
-        let made: windows::core::Result<Prelude> = unsafe {
-            (|| {
+        let try_make = || -> windows::core::Result<Prelude> {
+            // SAFETY: plain object creation.
+            unsafe {
                 let allocator: ID3D12CommandAllocator =
                     self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
                 let list: ID3D12GraphicsCommandList =
@@ -4164,12 +4178,20 @@ impl Host {
                         .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
                 list.Close()?;
                 Ok((allocator, list))
-            })()
+            }
+        };
+        let made = match try_make() {
+            Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY => {
+                urgent_reclaim(&e);
+                try_make()
+            }
+            other => other,
         };
         LISTS[1].fetch_add(1, Ordering::Relaxed);
         match made {
             Ok(prelude) => Some(prelude),
             Err(e) => {
+                urgent_reclaim(&e);
                 tracing::warn!(error = %e, "no host list for a prelude");
                 None
             }
@@ -7107,6 +7129,17 @@ impl HostList {
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
         let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
+        self.hold_list_upload(buffer, data, size)
+    }
+
+    /// CPU-only upload staging buffer held until the list resets (no `card_steps`
+    /// card fill, avoiding synchronous `mapped()` waits on texture uploads).
+    pub(crate) fn upload_cpu(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let (buffer, data) = host.upload_buffer(size)?;
+        self.hold_list_upload(buffer, data, size)
+    }
+
+    fn hold_list_upload(&self, buffer: ID3D12Resource, data: *mut u8, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
@@ -8793,6 +8826,7 @@ impl Host {
         heap: D3D12_HEAP_PROPERTIES,
         state: D3D12_RESOURCE_STATES,
         flags: D3D12_RESOURCE_FLAGS,
+        wait_resident: bool,
         wait_mapped: bool,
         diag_label: &'static str,
         warn_label: &'static str,
@@ -8811,15 +8845,18 @@ impl Host {
             Flags: flags,
             ..Default::default()
         };
+        let heap_flags = if wait_resident { not_resident() } else { D3D12_HEAP_FLAG_NONE };
         let try_create = || -> windows::core::Result<(ID3D12Resource, *mut u8)> {
             let mut buffer: Option<ID3D12Resource> = None;
             let mut data = std::ptr::null_mut();
             // SAFETY: plain creation and mapping of a CPU-visible buffer.
             unsafe {
                 self.device
-                    .CreateCommittedResource(&heap, not_resident(), &desc, state, None, &mut buffer)?;
+                    .CreateCommittedResource(&heap, heap_flags, &desc, state, None, &mut buffer)?;
                 let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                resident(&self.device, b)?;
+                if wait_resident {
+                    resident(&self.device, b)?;
+                }
                 if wait_mapped {
                     mapped(&self.device)?;
                 }
@@ -8829,9 +8866,7 @@ impl Host {
         };
         let made = match try_create() {
             Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY => {
-                crate::residency::allocation_error(&e);
-                crate::shadow::trim_snapshot_pool();
-                crate::pool::reclaim_staging_urgent();
+                urgent_reclaim(&e);
                 try_create()
             }
             other => other,
@@ -8864,6 +8899,7 @@ impl Host {
             heap,
             D3D12_RESOURCE_STATE_GENERIC_READ,
             D3D12_RESOURCE_FLAG_NONE,
+            false,
             false,
             "an upload buffer",
             "no upload buffer",
@@ -9704,6 +9740,16 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_with(size, true, true)
+    }
+
+    /// Write-back L0 CPU staging buffer for card-side shadow copies (`Card::staging`),
+    /// which shaders never bind in descriptors, avoiding `MakeResident`/`mapped()` waits.
+    pub(crate) fn shared_staging_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_with(size, false, false)
+    }
+
+    fn shared_buffer_with(&self, size: u64, wait_resident: bool, wait_mapped: bool) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9717,7 +9763,8 @@ impl Host {
             heap,
             D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            true,
+            wait_resident,
+            wait_mapped,
             "a shared buffer",
             "no shared buffer",
         )

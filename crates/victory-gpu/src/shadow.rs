@@ -2919,7 +2919,9 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        let idle_ms = crate::host::ram_idle_ms(
+            crate::residency::headroom().or_else(crate::host::available_physical_ram),
+        );
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
@@ -5082,12 +5084,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        let host = host()?;
         // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        // memory, and the CPU side only needs write-back staging.
+        let (buffer, data, card) = match card_for(size) {
             Some(on_card) => {
+                let (staging, data) = host.shared_staging_buffer(size)?;
+                crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
@@ -5095,16 +5098,20 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card {
-                    staging: buffer,
+                    staging,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
-                touched: Default::default(),
+                    touched: Default::default(),
                     size,
                 };
-                (on_card, Some(card))
+                (on_card, data, Some(card))
             }
-            None => (buffer, None),
+            None => {
+                let (buffer, data) = host.shared_buffer(size)?;
+                crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+                (buffer, data, None)
+            }
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5303,15 +5310,21 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
-    let (staging, data) = host.shared_buffer(len)?;
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
         host.uav_buffer(len)
     } else {
         None
     };
-    let buffer = match on_card {
-        Some(buffer) => buffer,
-        None => host.shared_buffer(len)?.0,
+    let (staging, data, buffer) = match on_card {
+        Some(buffer) => {
+            let (staging, data) = host.shared_staging_buffer(len)?;
+            (staging, data, buffer)
+        }
+        None => {
+            let (staging, data) = host.shared_staging_buffer(len)?;
+            let (buffer, _) = host.shared_buffer(len)?;
+            (staging, data, buffer)
+        }
     };
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
@@ -5410,24 +5423,29 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+    let host = host()?;
     // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    // buffer there, and the CPU side only needs write-back staging.
+    let (buffer, data, card) = match window_card_for(len) {
         Some(on_card) => {
+            let (staging, data) = host.shared_staging_buffer(len)?;
+            crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
-                staging: buffer,
+                staging,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
                 size: len,
             };
-            (on_card, Some(card))
+            (on_card, data, Some(card))
         }
-        None => (buffer, None),
+        None => {
+            let (buffer, data) = host.shared_buffer(len)?;
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+            (buffer, data, None)
+        }
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };

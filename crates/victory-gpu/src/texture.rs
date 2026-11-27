@@ -1030,7 +1030,7 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
     if bytes == 0 || bytes == u64::MAX {
         return;
     }
-    let Some((buffer, data)) = list.upload(host, bytes) else {
+    let Some((buffer, data)) = list.upload_cpu(host, bytes) else {
         return;
     };
     // SAFETY: a mapped buffer of `bytes` bytes, just made.
@@ -1096,7 +1096,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 host.device
                     .GetCopyableFootprints(&d, level, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
             }
-            let Some((buffer, data)) = list.upload(host, bytes) else {
+            let Some((buffer, data)) = list.upload_cpu(host, bytes) else {
                 // (With the levels that share its tiles, if it is one of
                 // the small ones.)
                 unzeroed |= tiled.with_level(level);

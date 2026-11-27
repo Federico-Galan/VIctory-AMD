@@ -720,6 +720,7 @@ impl<T> HeapRanges<T> {
         self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
     }
 
+    #[cfg(test)]
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
         self.0.iter().flatten()
     }
@@ -1028,15 +1029,45 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover.
+    // Per host copy, the span its picked views cover, folded in parallel
+    // across chunks of the slot table.
+    fn merge_span(
+        map: &mut crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        from: u64,
+        to: u64,
+    ) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        match map.get_mut(&key) {
+            Some(span) => {
+                span.1 = span.1.min(from);
+                span.2 = span.2.max(to);
+            }
+            None => {
+                map.insert(key, (shadow.clone(), from, to));
+            }
+        }
+    }
+    const SPAN_CHUNK: usize = 4096;
+    let span_chunks: Vec<&[Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>]> = ranges.0.chunks(SPAN_CHUNK).collect();
+    let chunk_spans: Vec<std::sync::OnceLock<(crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>, u32)>> =
+        span_chunks.iter().map(|_| Default::default()).collect();
+    crate::land::each_view(false, span_chunks.len(), &|n| {
+        let mut local: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
+        let mut count = 0u32;
+        for (shadow, from, to) in span_chunks[n].iter().flatten() {
+            count += 1;
+            merge_span(&mut local, shadow, *from, *to);
+        }
+        let _ = chunk_spans[n].set((local, count));
+    });
     let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
     let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
+    for (local, count) in chunk_spans.into_iter().filter_map(std::sync::OnceLock::into_inner) {
+        views += count;
+        for (_, (shadow, from, to)) in local {
+            merge_span(&mut spans, &shadow, from, to);
+        }
     }
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
