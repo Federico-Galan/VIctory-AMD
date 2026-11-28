@@ -37,6 +37,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -181,6 +182,9 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    // A region of the constants heap over it shows the pages the title had
+    // there, not those it maps now: the next ask opens the memory anew.
+    constants_forget(at as u64, len as u64);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -204,6 +208,193 @@ fn say() {
         s[1] >> 20,
         s[2],
         s[3] >> 20,
+        s[4],
+        s[5],
+        s[6],
+        s[7]
+    );
+}
+
+// The title's constants heap in place (`SCARLETT_INPLACE_CONSTANTS` / `VICTORY_INPLACE_CONSTANTS`).
+
+pub(crate) fn constants_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match mode_of(std::env::var("SCARLETT_INPLACE_CONSTANTS").ok().as_deref()) {
+        1 => {
+            tracing::info!("the constants heap is read and written by the card in place (VICTORY_INPLACE_CONSTANTS=1)");
+            true
+        }
+        2 => {
+            tracing::warn!(
+                "VICTORY_INPLACE_CONSTANTS=alt turned down: a title buffer cannot change form while the title runs (descriptor slots keep the copy \
+                 they were made with); the constants heap stays a copy. Compare a launch with =1 against one without, at equal draws"
+            );
+            false
+        }
+        _ => false,
+    })
+}
+
+fn mode_of(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        Some("alt") => 2,
+        _ => 0,
+    }
+}
+
+fn constants_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("SCARLETT_INPLACE_CONSTANTS_MIN_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(64)
+            << 20
+    })
+}
+
+const LOW: u64 = 1 << 32;
+
+struct Region {
+    start: u64,
+    end: u64,
+    heap: ID3D12Heap,
+}
+
+static REGIONS: Mutex<Vec<Region>> = Mutex::new(Vec::new());
+static ALIVE: AtomicU64 = AtomicU64::new(0);
+static CSTATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn constants_wanted(start: u64, len: u64, min: u64) -> bool {
+    len >= min.max(1)
+        && start.checked_add(len).is_some_and(|end| end <= LOW)
+        && matches!(cover(start as usize, len as usize), Cover::Run(..))
+}
+
+pub(crate) fn pages_of_range(start: u64, len: u64) -> (u64, u64) {
+    (start & !(K64 as u64 - 1), (start + len.max(1)).next_multiple_of(K64 as u64))
+}
+
+pub(crate) fn place_constants(start: u64, len: u64, fresh: bool) -> Option<Placed> {
+    if !constants_on() {
+        return None;
+    }
+    let host = crate::host::host()?;
+    match constants_place(&host.device, start, len, constants_min(), fresh) {
+        Ok(Some(placed)) => {
+            STATS[2].fetch_add(1, Ordering::Relaxed);
+            STATS[3].fetch_add(len, Ordering::Relaxed);
+            CSTATS[2].fetch_add(1, Ordering::Relaxed);
+            Some(placed)
+        }
+        Ok(None) => None,
+        Err((stat, why)) => {
+            if CSTATS[stat].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, why, "the constants heap not in place: a copy as before (VICTORY_INPLACE_CONSTANTS)");
+            }
+            None
+        }
+    }
+}
+
+fn constants_place(device: &ID3D12Device, start: u64, len: u64, min: u64, fresh: bool) -> Result<Option<Placed>, (usize, String)> {
+    let (at, end) = pages_of_range(start, len);
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match regions.iter().position(|r| r.start <= at && end <= r.end) {
+        Some(i) => i,
+        None => {
+            if !constants_wanted(at, end - at, min) {
+                return Ok(None);
+            }
+            if !fresh {
+                return Err((6, "a title buffer in its pages has a copy already".to_owned()));
+            }
+            let region = constants_open(device, at, end)?;
+            CSTATS[0].fetch_add(1, Ordering::Relaxed);
+            CSTATS[1].fetch_add(end - at, Ordering::Relaxed);
+            tracing::info!(
+                start = format_args!("{at:#x}"),
+                bytes = end - at,
+                "a title buffer of the constants heap in place: the card reads and writes the title's pages through a view of ours (VICTORY_INPLACE_CONSTANTS)"
+            );
+            regions.push(region);
+            ALIVE.store(regions.len() as u64, Ordering::Relaxed);
+            regions.len() - 1
+        }
+    };
+    let region = &regions[i];
+    let buffer = place(device, &region.heap, at - region.start, end - at).map_err(|e| (5, format!("no buffer placed in the region: {e}")))?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    Ok(Some(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at }))
+}
+
+fn constants_open(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
+    let bytes = (end - at) as usize;
+    let Cover::Run(section, offset) = cover(at as usize, bytes) else {
+        return Err((3, format!("not one run of a section: {:?}", cover(at as usize, bytes))));
+    };
+    if !offset.is_multiple_of(K64 as u64) {
+        return Err((3, format!("the run starts at {offset:#x} of its section")));
+    }
+    // SAFETY: the section of a view the title has; the range lies in the run.
+    let view = unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes) }.Value;
+    if view.is_null() {
+        return Err((4, format!("no view of ours: {}", std::io::Error::last_os_error())));
+    }
+    let unmap = || {
+        // SAFETY: our own view, nothing opened on it.
+        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view }) };
+    };
+    // SAFETY: inside our own view.
+    if unsafe { mem::VirtualAlloc(view, bytes, mem::MEM_COMMIT, mem::PAGE_READWRITE) }.is_null() {
+        let error = std::io::Error::last_os_error();
+        unmap();
+        return Err((4, format!("the view of ours not committed: {error}")));
+    }
+    match open(device, From::Part(view as usize, bytes)) {
+        Ok(heap) => Ok(Region { start: at, end, heap }),
+        Err(e) => {
+            unmap();
+            Err((5, format!("refused by the host: {e}")))
+        }
+    }
+}
+
+fn constants_forget(at: u64, len: u64) {
+    if ALIVE.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = regions.len();
+    regions.retain(|r| r.end <= at || r.start >= end);
+    ALIVE.store(regions.len() as u64, Ordering::Relaxed);
+    CSTATS[7].fetch_add((before - regions.len()) as u64, Ordering::Relaxed);
+}
+
+fn constants_say() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let s: Vec<u64> = CSTATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    let (alive, bytes) = {
+        let regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        (regions.len(), regions.iter().map(|r| r.end - r.start).sum::<u64>())
+    };
+    tracing::info!(
+        "the constants heap in place (VICTORY_INPLACE_CONSTANTS=1): {alive} regions {} MB (opened so far {}, {} MB), {} title buffers placed in them so far \
+         (no copy, no refresh, nothing sent up, hashed, compared or fetched for them); turned down: {} not one run of a section, {} no view of ours, \
+         {} refused by the host, {} a title buffer in its pages had a copy already; {} regions forgotten because the title mapped other pages there",
+        bytes >> 20,
+        s[0],
+        s[1] >> 20,
+        s[2],
+        s[3],
         s[4],
         s[5],
         s[6],
@@ -1222,6 +1413,9 @@ pub(crate) fn tick() {
     if level() > 0 {
         say();
     }
+    if constants_on() {
+        constants_say();
+    }
     if probe_level() == 0 {
         return;
     }
@@ -1454,6 +1648,98 @@ mod tests {
             assert!(text.contains("census,   view memory, one run of a section (one placed buffer): 1 of"), "{text}");
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn the_constants_switch_reads_off_on_and_alt() {
+        assert_eq!(mode_of(None), 0);
+        assert_eq!(mode_of(Some("0")), 0);
+        assert_eq!(mode_of(Some("1")), 1);
+        assert_eq!(mode_of(Some(" 1 ")), 1);
+        assert_eq!(mode_of(Some("alt")), 2);
+        assert_eq!(mode_of(Some("yes")), 0);
+    }
+
+    #[test]
+    fn warp_the_constants_heap_is_read_and_written_in_place_through_a_view_of_ours() {
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        // SAFETY: the section, placeholder, views and private memory made here.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let section = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_RESERVE, 0, 8 * K64 as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let mut low = mem::MEM_ADDRESS_REQUIREMENTS {
+                LowestStartingAddress: std::ptr::null_mut(),
+                HighestEndingAddress: (LOW - 1) as *mut c_void,
+                Alignment: 0,
+            };
+            let mut parameter = mem::MEM_EXTENDED_PARAMETER::default();
+            parameter.Anonymous1._bitfield = mem::MemExtendedParameterAddressRequirements as u64;
+            parameter.Anonymous2.Pointer = (&raw mut low).cast();
+            let hole = mem::VirtualAlloc2(process, std::ptr::null(), 8 * K64, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, &mut parameter, 1)
+                .cast::<u8>();
+            assert!(!hole.is_null(), "{}", std::io::Error::last_os_error());
+            assert!((hole as u64) + 8 * K64 as u64 <= LOW);
+            mem::VirtualFree(hole.cast(), 3 * K64, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER);
+            let mut views = Vec::new();
+            for (page, n) in [(0usize, 3usize), (3, 5)] {
+                let view = mem::MapViewOfFile3(section, process, hole.add(page * K64).cast(), (page * K64) as u64, n * K64, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+                assert!(!view.Value.is_null(), "{}", std::io::Error::last_os_error());
+                assert!(!mem::VirtualAlloc(view.Value, n * K64, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+                title_memory_view(view.Value as usize, n * K64, section as usize, (page * K64) as u64);
+                views.push(view);
+            }
+            let base = hole as u64;
+            assert_eq!(cover(base as usize, 8 * K64), Cover::Run(section as usize, 0));
+            let (start, len) = (base + K64 as u64 + 0x40, 5 * K64 as u64);
+            let regions = || REGIONS.lock().unwrap().len();
+            let before = regions();
+            assert!(constants_place(&device, start, len, 64 << 20, true).unwrap().is_none());
+            assert_eq!(regions(), before);
+            assert_eq!(constants_place(&device, start, len, K64 as u64, false).err().map(|e| e.0), Some(6));
+            assert_eq!(regions(), before);
+            let placed = constants_place(&device, start, len, K64 as u64, true).unwrap_or_else(|e| panic!("not placed: {e:?}")).expect("placed");
+            assert_eq!(regions(), before + 1);
+            assert_eq!(placed.bias, 0x40);
+            assert_eq!(placed.gpu, placed.buffer.GetGPUVirtualAddress() + 0x40);
+            let mut rig = Rig::new(&device).unwrap();
+            fill(start as *mut u8, len as usize, 11);
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(same(start as *const u8, &got), "the card reads the title's bytes across both views");
+            fill(start as *mut u8, len as usize, 97);
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(same(start as *const u8, &got), "and what the CPU wrote afterwards, with no call between");
+            rig.store(&placed.buffer, placed.bias + 3 * K64 as u64, &[0x5a; 256]).unwrap();
+            assert!(same((start + 3 * K64 as u64) as *const u8, &[0x5a; 256]), "the card's copy lands at the title's address");
+            (start as *mut [u32; 3]).write_unaligned([40, 2, 0]);
+            rig.shade(placed.gpu).unwrap();
+            assert_eq!((start as *const [u32; 3]).read_unaligned()[2], 42, "a shader's store lands at the title's address");
+            let inside = constants_place(&device, base + 6 * K64 as u64, 100, u64::MAX, false).unwrap().expect("placed in the region");
+            assert_eq!(regions(), before + 1, "one region");
+            assert_eq!(inside.bias, 0);
+            let private = mem::VirtualAlloc(std::ptr::null(), 4 * K64, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            assert!(constants_place(&device, private as u64, 4 * K64 as u64, K64 as u64, true).unwrap().is_none());
+            mem::VirtualFree(private, 0, mem::MEM_RELEASE);
+            for view in views {
+                assert!(mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER) != 0, "the title's view unmapped under the heap");
+            }
+            views_gone(base as usize, 8 * K64);
+            rig.store(&placed.buffer, placed.bias, &[0xc3; 64]).unwrap();
+            let other = mem::MapViewOfFile(section, mem::FILE_MAP_READ, 0, 0, 2 * K64);
+            assert!(!other.Value.is_null());
+            assert!(same((other.Value as usize + K64 + 0x40) as *const u8, &[0xc3; 64]), "the heap is the section's pages, not the title's view");
+            mem::UnmapViewOfFile(other);
+            constants_forget(base, 8 * K64 as u64);
+            assert_eq!(regions(), before);
+            drop((placed, inside));
+            mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
+            mem::VirtualFree(hole.add(3 * K64).cast(), 0, mem::MEM_RELEASE);
+            windows_sys::Win32::Foundation::CloseHandle(section);
         }
     }
 }

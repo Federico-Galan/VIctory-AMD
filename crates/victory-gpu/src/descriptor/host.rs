@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -111,7 +112,13 @@ impl Made {
     }
 }
 
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    /// Identity of this host heap instance, checked by [`HostHeap::release`]
+    /// so a stale list resetting after a title heap was replaced at the same
+    /// address does not free slots belonging to the new heap.
+    id: u64,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -1492,6 +1499,87 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// For [`crate::host::wait_for_slots`]: fewest free dynamic slots seen since
+/// the last frame-rate log (`u32::MAX` if none asked) and the heap's capacity.
+pub(crate) static DYNAMIC_LOW: [std::sync::atomic::AtomicU32; 2] =
+    [std::sync::atomic::AtomicU32::new(u32::MAX), std::sync::atomic::AtomicU32::new(0)];
+
+/// Bound dynamic raw views to their host buffer (`SCARLETT_RAW_VIEW_CLAMP=0`
+/// restores unclamped ranges).
+fn raw_view_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("SCARLETT_RAW_VIEW_CLAMP")
+            .or_else(|| std::env::var_os("VICTORY_RAW_VIEW_CLAMP"))
+            .is_none_or(|v| v != "0")
+    })
+}
+
+#[derive(Clone, Copy)]
+struct RawRange {
+    first: u64,
+    elements: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    Past,
+    Length,
+    Short,
+    Unaligned,
+}
+
+fn raw_range(size: u64, offset: u64, len: u64) -> (Option<RawRange>, Option<Cut>) {
+    let words = size / 4;
+    if !offset.is_multiple_of(16) {
+        return (None, Some(Cut::Unaligned));
+    }
+    let asked = offset / 4;
+    if asked >= words {
+        return (None, Some(Cut::Past));
+    }
+    let avail = words - asked;
+    let want = (len / 4).max(1);
+    let elements = want.min(avail).min(u64::from(u32::MAX));
+    let cut = if elements < want {
+        Some(Cut::Length)
+    } else if len < 4 {
+        Some(Cut::Short)
+    } else {
+        None
+    };
+    (
+        Some(RawRange {
+            first: asked,
+            elements: elements as u32,
+        }),
+        cut,
+    )
+}
+
+static RAW_SRV_CUTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static RAW_UAV_CUTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn raw_view_counts() -> [[u64; 4]; 2] {
+    [&RAW_SRV_CUTS, &RAW_UAV_CUTS].map(|cuts| cuts.each_ref().map(|n| n.load(Ordering::Relaxed)))
+}
+
+fn raw_view_range(buffer: &ID3D12Resource, offset: u64, len: u64, counts: &[AtomicU64; 4]) -> Option<RawRange> {
+    if !raw_view_clamp() {
+        return Some(RawRange {
+            first: offset / 4,
+            elements: (len / 4).clamp(1, u64::from(u32::MAX)) as u32,
+        });
+    }
+    // SAFETY: `buffer` is a live D3D12 resource.
+    let size = unsafe { buffer.GetDesc() }.Width;
+    let (range, cut) = raw_range(size, offset, len);
+    if let Some(cut) = cut {
+        counts[cut as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    range
+}
+
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `SCARLETT_DYNAMIC_SLOTS`
@@ -1601,6 +1689,7 @@ impl HostHeap {
             })
             .flatten();
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -1766,6 +1855,11 @@ impl HostHeap {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
+            DYNAMIC_LOW[0].fetch_min(
+                self.free.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            DYNAMIC_LOW[1].store(self.dynamic, std::sync::atomic::Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -1779,7 +1873,12 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        let free = self
+            .free
+            .fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(n as u32);
+        DYNAMIC_LOW[0].fetch_min(free, std::sync::atomic::Ordering::Relaxed);
+        DYNAMIC_LOW[1].store(self.dynamic, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
     }
@@ -2784,11 +2883,19 @@ impl HostHeap {
         }
     }
 
+    /// Identity of this host heap instance (checked by [`HostHeap::release`]).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), only if `id` matches this host heap.
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -2951,15 +3058,18 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let Some(range) = raw_view_range(buffer, offset, len, &RAW_SRV_CUTS) else {
+            self.null_raw_at(index);
+            return;
+        };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -2993,14 +3103,17 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let Some(range) = raw_view_range(buffer, offset, len, &RAW_UAV_CUTS) else {
+            self.null_raw_uav_at(index);
+            return;
+        };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -5702,9 +5815,27 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let (Some(a), Some(b)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return; // no host GPU
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).unwrap();
+        let after_alloc = a.free.load(Ordering::Relaxed);
+        a.release(b.id(), first, 2);
+        assert_eq!(
+            a.free.load(Ordering::Relaxed),
+            after_alloc,
+            "releasing with another heap's identity must not free slots"
+        );
+        a.release(a.id(), first, 2);
+        assert_eq!(a.free.load(Ordering::Relaxed), after_alloc + 2);
     }
 
     #[test]
@@ -5720,18 +5851,43 @@ mod tests {
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id(), left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id(), left, 2);
+        heap.release(heap.id(), right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id(), first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    #[test]
+    fn raw_ranges_stay_inside_their_buffer() {
+        let sizes = [0u64, 1, 3, 4, 100, 1024, 4096, 1 << 30];
+        let offsets = [0u64, 4, 16, 48, 96, 112, 1024, 1040, 4096, u64::MAX];
+        let lens = [0u64, 1, 3, 4, 16, 512, 1 << 20, u64::MAX];
+        for size in sizes {
+            for offset in offsets {
+                for len in lens {
+                    let (range, _) = raw_range(size, offset, len);
+                    let aligned = offset.is_multiple_of(16);
+                    let inside = offset / 4 < size / 4;
+                    match range {
+                        Some(range) => {
+                            assert!(range.elements > 0, "{size} {offset} {len}");
+                            assert_eq!(range.first, offset / 4);
+                            assert_eq!(range.first % 4, 0);
+                            assert!(range.first + u64::from(range.elements) <= size / 4);
+                        }
+                        None => assert!(!(aligned && inside), "{size} {offset} {len}"),
+                    }
+                }
+            }
+        }
     }
 
     #[test]

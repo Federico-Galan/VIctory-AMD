@@ -121,6 +121,9 @@ pub(crate) struct AllocationInfo {
 
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
+// `placed_resource_words` in `descriptor.rs` copies the two field spans on either side of the padding.
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
@@ -1590,7 +1593,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
+            // (Not one that only waits for a place in a block,
+            // `crate::pool::waiting`: it is asked for again.)
+            if !crate::pool::waits() {
+                r.host.refused.store(true, Relaxed);
+            }
             return None;
         };
         let twin = twin_texture(&r.desc, &texture);
@@ -1696,43 +1703,101 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
-        }
+        Some([budget, used, ..]) => weighed(budget, used) < room_line(budget),
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+#[cfg(any(windows, test))]
+fn room_line(budget: u64) -> u64 {
+    budget / 100 * room_percent()
+}
+
+/// What [`room`] and the sweep ([`let_go_idle`]) weigh against the line, in
+/// bytes of a budget of `budget` with `used` in use: the card's use less
+/// the free part of the texture blocks, with what is kept for buffer
+/// copies and render targets. While no block of textures can be made
+/// ([`block_room`]), not less than [`blocks_full`].
+#[cfg(windows)]
+fn weighed(budget: u64, used: u64) -> u64 {
+    let free = crate::pool::texture_room();
+    let by_use = used.saturating_sub(free) + crate::shadow::card_room_kept() + targets_room_kept();
+    if crate::pool::gate() && !block_room(Some([budget, used, 0, 0])) {
+        by_use.max(blocks_full(room_line(budget), free))
+    } else {
+        by_use
+    }
+}
+
+#[cfg(any(windows, test))]
+fn blocks_full(line: u64, free: u64) -> u64 {
+    (line + POOL_BLOCK).saturating_sub(free)
+}
+
+#[cfg(any(windows, test))]
+const POOL_BLOCK: u64 = 64 << 20;
+
+/// Whether the card has room for one more block of textures (`crate::pool::gate`).
+#[cfg(windows)]
+pub(crate) fn block_room(memory: Option<[u64; 4]>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some([budget, used, ..]) = memory else {
+        return true;
+    };
+    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    let room = filled < texture_floor_bytes(Some(budget))
+        || block_fits(used, crate::shadow::card_room_kept() + targets_to_come(), room_line(budget));
+    crate::pool::note_full(!room);
+    room
+}
+
+#[cfg(any(windows, test))]
+fn block_fits(used: u64, kept: u64, line: u64) -> bool {
+    used + kept + POOL_BLOCK <= line
+}
+
+/// Whether `len` more bytes of title memory by address go into the card's own
+/// memory while leaving room for render targets still to come.
+#[cfg(windows)]
+pub(crate) fn by_address_room(budget: u64, used: u64, len: u64) -> bool {
+    by_address_fits(budget, used, len, targets_to_come())
+}
+
+#[cfg(any(windows, test))]
+fn by_address_fits(budget: u64, used: u64, len: u64, to_come: u64) -> bool {
+    used + len + to_come < budget / 100 * 97
+}
+
+#[cfg(windows)]
+pub(crate) fn targets_to_come() -> u64 {
+    targets_most().saturating_sub(targets_now())
+}
+
+#[cfg(windows)]
+fn targets_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("SCARLETT_CARD_ROOM_FOR_TARGETS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+    })
+}
+
+#[cfg(windows)]
+fn targets_now() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed))
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet: `SCARLETT_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
 /// before) less what such copies hold now.
-///
-/// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
-/// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
-/// on, none of them idle (run 198's census). They are made with no room
-/// test, in the same frame as the card copies of title buffers (762 MB),
-/// after the texture queue has filled the card to its line with textures
-/// written while the world loaded (7.3 GB of them at the first world frame
-/// of run 193, of which 2.3 GB were let go again within 13 seconds). The
-/// card then stood at 99 to 100.5 % of its budget, buffer copies were
-/// turned down for good (31 of 95 made: the frame 355 ms where 95 give
-/// 238), and the queue was refused from the first world frame on. With
-/// their room kept, the queue stops that much earlier while the world
-/// loads and gets it back as the targets are made.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
-    use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("SCARLETT_CARD_ROOM_FOR_TARGETS_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
-    });
-    // Every host texture's bytes less those of the copies the title fills.
-    let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    let most = targets_most();
+    let targets = targets_now();
     most.saturating_sub(targets)
 }
 
@@ -2036,12 +2101,7 @@ pub(crate) fn let_go_idle() {
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("SCARLETT_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept();
-            crate::host::vram_keep(budget, used)
-        }
+        Some([budget, used, ..]) if keep => crate::host::vram_keep(budget, weighed(budget, used)),
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
@@ -2501,6 +2561,9 @@ fn host_texture_as(
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
         return Some(t);
+    }
+    if !reserved && crate::pool::waits() {
+        return None;
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -4580,4 +4643,33 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
     }
+
+    #[test]
+    fn a_block_of_textures_wants_room_for_itself_and_for_what_is_to_come() {
+        const MB: u64 = 1 << 20;
+        assert!(block_fits(8909 * MB, 0, 9286 * MB));
+        assert!(!block_fits(8909 * MB, 1141 * MB, 9286 * MB));
+        assert!(block_fits(1000 * MB, 100 * MB, 1164 * MB));
+        assert!(!block_fits(1000 * MB, 100 * MB, 1164 * MB - 1));
+        let line = 9520 * MB;
+        assert!(blocks_full(line, 65 * MB) < line);
+        assert!(blocks_full(line, 64 * MB) >= line);
+        assert!(blocks_full(line, 0) >= line);
+    }
+
+    #[test]
+    fn title_memory_by_address_leaves_room_for_the_targets_to_come() {
+        const MB: u64 = 1 << 20;
+        let budget = 10290 * MB;
+        assert!(by_address_fits(budget, 9900 * MB, 64 * MB, 0));
+        assert!(!by_address_fits(budget, 9920 * MB, 64 * MB, 0));
+        assert!(by_address_fits(budget, 8700 * MB, 64 * MB, 1141 * MB));
+        assert!(!by_address_fits(budget, 8800 * MB, 64 * MB, 1141 * MB));
+    }
+}
+
+/// Whether `this` is a live title texture of ours.
+#[cfg(windows)]
+pub(crate) fn is_texture(this: This) -> bool {
+    textures().contains(&(this as usize))
 }

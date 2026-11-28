@@ -37,6 +37,8 @@ pub(crate) struct Pending {
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// Total milliseconds draws have waited for this pipeline across all frames.
+    waited_ms: AtomicU64,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -50,6 +52,10 @@ pub(crate) struct Pending {
     left_out: Option<&'static str>,
     /// Left out while ray tracing is off (`ray_tracing`, live).
     ray_pass: Option<&'static str>,
+    /// `CS_RaytracingResolve` / `CS_ScreenProbes_ActivateRays` enabled when
+    /// `KLBF_FOLIAGE_FIX=1` without BVH: queued at low priority without blocking
+    /// the main thread or frame wait budget.
+    foliage_pass: bool,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -58,16 +64,35 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
+fn foliage_pass(shaders: &[Arc<Shader>]) -> bool {
+    let builder = std::env::var_os("SCARLETT_BVH_BUILDER").is_some_and(|v| v == "1");
+    !builder && (named(shaders, b"CS_RaytracingResolve") || named(shaders, b"CS_ScreenProbes_ActivateRays"))
+}
+
+/// `KLBF_FOLIAGE_FIX` (`=1` enables; off by default). The screen probes' light
+/// goes through `CS_RaytracingResolve` and `CS_ScreenProbes_ActivateRays`: left
+/// out without the builder, the probes keep what their memory held, and shaded
+/// foliage, blinds and curtains can read magenta or shade black. When enabled,
+/// both are compiled in the background (`SCARLETT_RT_RESOLVE=0` /
+/// `SCARLETT_ACTIVATE_RAYS=0` disable individually). Off by default because
+/// without BVH (`SCARLETT_BVH_BUILDER=0`), ~1,000 cold `CS_RaytracingResolve`
+/// shaders saturate CPU compiler threads for minutes and starve world draws.
+/// ryuki's find (YukiRyuu/RYUKI-7900XT 362f600b).
+fn foliage_fix() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KLBF_FOLIAGE_FIX").is_some_and(|v| v == "1"))
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("SCARLETT_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return false;
-        }
         // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
         // clogging the cold compiler queue; skip unless SCARLETT_RT_RESOLVE=1.
-        std::env::var_os("SCARLETT_RT_RESOLVE").is_none_or(|v| v == "0")
+        // With `KLBF_FOLIAGE_FIX` (on): made unless SCARLETT_RT_RESOLVE=0.
+        let rt_resolve = std::env::var_os("SCARLETT_RT_RESOLVE");
+        let off = rt_resolve.as_ref().is_some_and(|v| v == "0");
+        !builder && (off || rt_resolve.is_none() && !foliage_fix())
     });
     if skip_rt && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
@@ -75,7 +100,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
     let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
         let builder = std::env::var_os("SCARLETT_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
+        if builder || foliage_fix() {
             return std::env::var_os("SCARLETT_ACTIVATE_RAYS").is_some_and(|v| v == "0");
         }
         std::env::var_os("SCARLETT_ACTIVATE_RAYS").is_none_or(|v| v == "0")
@@ -120,23 +145,26 @@ impl Pending {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        key.update(graphics.as_ref().map(|g| g.key_text()).unwrap_or_default().as_bytes());
         let scene_input = scene_input(&shaders);
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
         let left_out = left_out(&shaders);
         let ray_pass = super::ray_tracing::omission(&shaders);
+        let foliage_pass = foliage_pass(&shaders);
         Pending {
             screen,
             scene_input,
             left_out,
             ray_pass,
+            foliage_pass,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
+            waited_ms: AtomicU64::new(0),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
@@ -239,12 +267,15 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
-        if p.graphics.is_none() && compute_waits() {
-            // Made here, or waited for while a worker makes it.
-            p.make();
-        } else {
-            wait(p, crate::frame::current());
+        let priority = if p.foliage_pass { EARLY } else { REQUESTED };
+        start(p, priority);
+        if !p.foliage_pass {
+            if p.graphics.is_none() && compute_waits() {
+                // Made here, or waited for while a worker makes it.
+                p.make();
+            } else {
+                wait(p, crate::frame::current());
+            }
         }
     }
     p.made.get()?.as_ref()
@@ -301,11 +332,32 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("SCARLETT_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Cumulative wait allowed per pipeline across all frames
+/// (`SCARLETT_PIPELINE_WAIT_CAP_MS` / `VICTORY_PIPELINE_WAIT_CAP_MS`, default
+/// 5000 ms; 0 disables the cap).
+fn wait_cap_ms() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        match std::env::var("SCARLETT_PIPELINE_WAIT_CAP_MS")
+            .or_else(|_| std::env::var("VICTORY_PIPELINE_WAIT_CAP_MS"))
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+        {
+            Some(0) => u64::MAX,
+            Some(n) => n,
+            None => 5000,
+        }
+    })
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
+        return;
+    }
+    if !screen && p.waited_ms.load(Ordering::Relaxed) >= wait_cap_ms() {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
@@ -339,6 +391,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    p.waited_ms.fetch_add(waited.as_millis() as u64, Ordering::Relaxed);
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -415,7 +468,8 @@ impl Queue {
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
-        self.push_as(p, priority, slow_limit() != usize::MAX && super::library::slow(&p.key))
+        let slow = p.foliage_pass || (slow_limit() != usize::MAX && super::library::slow(&p.key));
+        self.push_as(p, priority, slow)
     }
 
     fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
@@ -690,5 +744,41 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn foliage_pass_pipelines_queue_slow_and_skip_by_default() {
+        let rt_resolve = Arc::new(super::super::Shader {
+            stage: "compute",
+            hash: "foliage-resolve-test".to_owned(),
+            container: b"test_CS_RaytracingResolve_pass".to_vec(),
+            #[cfg(windows)]
+            ambient: None,
+            #[cfg(windows)]
+            translated: OnceLock::new(),
+        });
+        let p = Arc::new(Pending::new(vec![rt_resolve], None));
+        assert!(p.foliage_pass);
+        assert!(p.left_out.is_some());
+        assert!(ready(&p).is_none());
+        assert!(p.made.get().is_none());
+
+        // Even when allowed (`left_out = None` under `KLBF_FOLIAGE_FIX=1`), a
+        // `foliage_pass` pipeline must queue as slow behind quick early work
+        // and never block/wait on the frame wait budget inside `ready()`.
+        let mut enabled = Pending::new(Vec::new(), None);
+        enabled.foliage_pass = true;
+        let enabled = Arc::new(enabled);
+        let quick = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&enabled, EARLY), Some(true));
+        assert_eq!(queue.push(&quick, EARLY), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &quick));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &enabled));
+        assert!(enabled.was_slow.load(Ordering::Relaxed));
+
+        enabled.queue_state.store(MAKING, Ordering::Relaxed);
+        assert!(ready(&enabled).is_none());
+        assert!(enabled.made.get().is_none());
     }
 }

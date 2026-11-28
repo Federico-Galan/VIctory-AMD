@@ -92,6 +92,41 @@ fn ask(what: &str, from: u32) {
     }
 }
 
+/// Run helper pools waited on by the submitting thread (`wide`, `land`,
+/// `heap-sync`, `aside`) at the submitting thread's priority so 6-core CPUs
+/// do not starve them behind title/translation threads (`SCARLETT_HELPER_PRIORITY=0` off).
+fn helpers_raised() -> bool {
+    crate::toggled!("SCARLETT_HELPER_PRIORITY")
+}
+
+/// Keeps a helper thread at [`helpers_raised`] priority, updating the OS
+/// thread priority only when the toggle changes.
+pub(crate) struct Priority {
+    applied: Option<bool>,
+}
+
+impl Priority {
+    pub(crate) fn new() -> Self {
+        let mut priority = Self { applied: None };
+        priority.keep();
+        priority
+    }
+
+    pub(crate) fn keep(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+        };
+        let on = helpers_raised();
+        if self.applied == Some(on) {
+            return;
+        }
+        let priority = if on { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+        // SAFETY: current thread handle.
+        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+        self.applied = Some(on);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -172,6 +172,7 @@ impl Ahead {
         i > 0 && self.reach[i - 1] >= last
     }
 
+    #[cfg(test)]
     fn push(&mut self, range: (usize, usize)) {
         let i = self.ranges.partition_point(|&r| r <= range);
         self.ranges.insert(i, range);
@@ -610,18 +611,33 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
+    let mut pending: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|&&(start, end)| start < end && !published(start, end))
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .filter(|&(first, last)| !ahead.holds(first, last))
+        .collect();
+    // Sort start ascending, then end descending so subsumed ranges are skipped
+    // in O(1) without calling `kernel_written` or rebuilding `Ahead` O(n^2).
+    pending.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    let mut asked = std::mem::take(&mut ahead.ranges);
+    let prev_asked = asked.len();
     let mut written = Vec::new();
-    for &(start, end) in ranges {
-        if start >= end || published(start, end) {
+    let mut covered_end = 0usize;
+    for (first, last) in pending {
+        if last <= covered_end {
             continue;
         }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.holds(first, last)
-            && let Some(pages) = kernel_written(first, last)
-        {
+        if let Some(pages) = kernel_written(first, last) {
             written.extend(pages);
-            ahead.push((first, last));
+            asked.push((first, last));
+            covered_end = last;
         }
+    }
+    if asked.len() > prev_asked {
+        ahead = Ahead::from(asked);
+    } else {
+        ahead.ranges = asked;
     }
     note_hot(&written);
     let mut j = journal_mut();
@@ -3218,6 +3234,32 @@ mod tests {
         let last = journal().written.get(&(p / PAGE + 1)).copied();
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn ask_rest_subsumes_overlapping_ranges_and_keeps_valid_coverage() {
+        // SAFETY: fresh write-watched allocation freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 6 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        ask_once_end();
+        // Subsumed ranges passed in reverse/mixed order must not miss pages or leave stale Ahead state.
+        let ranges = [
+            (p + PAGE, p + 3 * PAGE),
+            (p, p + 5 * PAGE),
+            (p + 2 * PAGE, p + 4 * PAGE),
+            (p, p + 2 * PAGE),
+        ];
+        unsafe { ((p + 4 * PAGE) as *mut u8).write_volatile(7) };
+        ask_rest(&ranges);
+        let j = journal();
+        assert!(j.ahead.holds(p / PAGE, (p + 5 * PAGE) / PAGE));
+        assert!(j.written.contains_key(&(p / PAGE + 4)));
+        drop(j);
+        ask_once_end();
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }

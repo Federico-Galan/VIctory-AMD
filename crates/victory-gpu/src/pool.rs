@@ -91,6 +91,99 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("SCARLETT_TEXTURE_POOL").is_none_or(|v| v != "0"))
 }
 
+/// Whether a new block of textures is made only while the card has room for
+/// it (on by default; `SCARLETT_POOL_GATE=0`: whenever no block has room).
+pub(crate) fn gate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SCARLETT_POOL_GATE").is_none_or(|v| v != "0"))
+}
+
+/// Whether a piece is cut from the fullest block that has room for it (on
+/// by default; `SCARLETT_POOL_FULLEST=0`: first-fit).
+fn fullest() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SCARLETT_POOL_FULLEST").is_none_or(|v| v != "0"))
+}
+
+fn smaller(known: Option<(u64, u64)>, len: u64, align: u64) -> (u64, u64) {
+    match known {
+        Some((l, a)) if l <= len && a <= align => (l, a),
+        _ => (len, align),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Grow {
+    Yes,
+    Must,
+    No,
+}
+
+/// Since the start: blocks made, blocks not made for want of room on the card,
+/// and blocks made without that room for textures that could not wait.
+pub(crate) static BLOCKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+const MADE: usize = 0;
+const NOT_MADE: usize = 1;
+const PAST: usize = 2;
+
+static FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn full() -> bool {
+    gate() && FULL.load(Ordering::Relaxed)
+}
+
+pub(crate) fn note_full(full: bool) {
+    FULL.store(full, Ordering::Relaxed);
+}
+
+fn may_grow() -> bool {
+    if !gate() {
+        return true;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let tenth = now() / 100 + 1;
+    let last = LAST.load(Ordering::Relaxed);
+    if last >> 1 == tenth {
+        return last & 1 != 0;
+    }
+    let room = crate::resource::block_room(crate::host::host().and_then(|h| h.video_memory()));
+    LAST.store((tenth << 1) | u64::from(room), Ordering::Relaxed);
+    room
+}
+
+thread_local! {
+    static CAN_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WAITED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn waiting<T>(make: impl FnOnce() -> T) -> (T, bool) {
+    let was = CAN_WAIT.replace(true);
+    WAITED.set(false);
+    let made = make();
+    CAN_WAIT.set(was);
+    (made, WAITED.replace(false))
+}
+
+pub(crate) fn waits() -> bool {
+    WAITED.get()
+}
+
+/// For the log: `[blocks, free_bytes, q0_n, q0_held, q1_n, q1_held, q2_n, q2_held, q3_n, q3_held, given]`.
+pub(crate) fn fill() -> [u64; 11] {
+    let pool = lock(&TEXTURES);
+    let mut f = [0u64; 11];
+    for block in pool.blocks.iter().flatten() {
+        let holds = BLOCK.saturating_sub(block.room);
+        f[0] += 1;
+        f[1] += block.room;
+        let quarter = (holds * 4 / BLOCK).min(3) as usize;
+        f[2 + 2 * quarter] += 1;
+        f[3 + 2 * quarter] += holds;
+    }
+    f[10] = pool.given;
+    f
+}
+
 /// How many blocks of textures are made ahead, so that one has been there
 /// for a while when its first piece is taken (`SCARLETT_RIPE_BLOCKS`, 12;
 /// 0: none, and new blocks are used at once, as before).
@@ -115,15 +208,27 @@ struct Ripe {
     started: u64,
     finished: u64,
     ahead: usize,
+    grow: Grow,
+    fullest: bool,
 }
 
 impl Ripe {
-    const ALL: Ripe = Ripe { started: 0, finished: 0, ahead: 0 };
+    const ALL: Ripe = Ripe { started: 0, finished: 0, ahead: 0, grow: Grow::Yes, fullest: false };
 
     fn now() -> Ripe {
         let (started, finished) = crate::host::submissions();
         // Not more than are kept ([`room`]): they would go and be made again.
-        Ripe { started, finished, ahead: ahead().min(SPARES.load(Ordering::Relaxed)) }
+        Ripe {
+            started,
+            finished,
+            ahead: ahead().min(SPARES.load(Ordering::Relaxed)),
+            grow: Grow::Yes,
+            fullest: fullest(),
+        }
+    }
+
+    fn pooled(self, len: u64) -> bool {
+        len != 0 && len <= if self.ahead > 0 { BLOCK } else { BLOCK / 2 }
     }
 
     fn is<B>(self, block: &Block<B>) -> bool {
@@ -187,6 +292,8 @@ pub(crate) struct Piece {
 struct Block<B> {
     memory: B,
     free: Ranges,
+    room: u64,
+    no_fit: Option<(u64, u64)>,
     /// The end of the highest piece ever taken: above it the memory is as
     /// it was made (zeros).
     used_to: u64,
@@ -206,11 +313,21 @@ struct Pool<B> {
     spare: usize,
     most: usize,
     retry_growth_at: u64,
+    no_fit: Option<(u64, u64)>,
+    given: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool {
+            blocks: Vec::new(),
+            resting: VecDeque::new(),
+            spare: 0,
+            most,
+            retry_growth_at: 0,
+            no_fit: None,
+            given: 0,
+        }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -229,23 +346,39 @@ impl<B: Clone> Pool<B> {
         ripe: Ripe,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
-        // With blocks made ahead, what would be an allocation of its own (and
-        // new when the card first reads it) lies in one of those too.
-        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+        if !ripe.pooled(len) {
             return None;
         }
         self.rested(now);
+        let known = self.no_fit.is_some_and(|(l, a)| len >= l && align >= a);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
+        if known {
+            // Known to fit no block.
+        } else if ripe.fullest {
+            let fits = |b: &&Block<B>| ripe.is(b) && b.room >= len && !b.no_fit.is_some_and(|(l, a)| len >= l && align >= a);
+            let mut order: Vec<(u64, usize)> =
+                self.blocks.iter().enumerate().filter_map(|(i, b)| b.as_ref().filter(fits).map(|b| (b.room, i))).collect();
+            order.sort_unstable();
+            for (_, i) in order {
+                let Some(block) = self.blocks[i].as_mut() else { continue };
+                if let Some(start) = block.free.take(len, align) {
+                    found = Some((i, start));
+                    break;
+                }
+                block.no_fit = Some(smaller(block.no_fit, len, align));
+            }
+        } else {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
             }
         }
-        if found.is_none() && ripe.ahead > 0 {
+        if found.is_none() && !known && ripe.ahead > 0 {
             // The one that has been there the longest.
             let mut unripe: Vec<(u64, usize)> =
                 self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
@@ -257,11 +390,20 @@ impl<B: Clone> Pool<B> {
         let (i, start) = match found {
             Some(found) => found,
             None => {
+                if !known {
+                    self.no_fit = Some(smaller(self.no_fit, len, align));
+                }
+                if ripe.grow == Grow::No {
+                    return None;
+                }
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
+        if let Some(block) = self.blocks[i].as_mut() {
+            block.room -= len;
+        }
         if ripe.ahead > 0 {
             if !ripe.is(self.blocks[i].as_ref()?) {
                 let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -271,6 +413,7 @@ impl<B: Clone> Pool<B> {
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
             if empty < ripe.ahead
+                && ripe.grow == Grow::Yes
                 && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
@@ -301,7 +444,16 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block {
+            memory,
+            free: Ranges::new(BLOCK),
+            room: BLOCK,
+            no_fit: None,
+            used_to: 0,
+            made,
+            since: crate::host::now_ms(),
+        });
+        self.no_fit = None;
         i
     }
 
@@ -323,8 +475,11 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
+                block.room += piece.len;
+                block.no_fit = None;
                 any |= block.free.whole(BLOCK);
             }
+            self.no_fit = None;
         }
         // (Without a piece given back too, once there is less room.)
         let most = limit.min(self.most);
@@ -336,6 +491,7 @@ impl<B: Clone> Pool<B> {
                     spare += 1;
                     if spare > most {
                         *block = None;
+                        self.given += 1;
                     }
                 }
             }
@@ -528,8 +684,14 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    WAITED.set(false);
+    let mut ripe = Ripe::now();
+    ripe.grow = match (may_grow(), CAN_WAIT.get()) {
+        (true, _) => Grow::Yes,
+        (false, false) => Grow::Must,
+        (false, true) => Grow::No,
+    };
+    let taken = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), ripe, || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -548,8 +710,27 @@ pub(crate) unsafe fn texture(
             tracing::warn!(error = %e, "a block of texture memory is not resident");
             return None;
         }
+        if heap.is_some() {
+            BLOCKS[MADE].fetch_add(1, Ordering::Relaxed);
+            if ripe.grow == Grow::Must {
+                let n = BLOCKS[PAST].fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!(
+                        "blocks of textures made without room on the card, for textures that could not wait: {n}"
+                    );
+                }
+            }
+        }
         heap
-    })?;
+    });
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    let Some((piece, heap, again)) = taken else {
+        if ripe.grow == Grow::No && ripe.pooled(info.SizeInBytes) {
+            BLOCKS[NOT_MADE].fetch_add(1, Ordering::Relaxed);
+            WAITED.set(true);
+        }
+        return None;
+    };
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -690,7 +871,7 @@ mod tests {
             made.set(made.get() + 1);
             Some(made.get())
         };
-        let at = |started, finished| Ripe { started, finished, ahead: 2 };
+        let at = |started, finished| Ripe { started, finished, ahead: 2, ..Ripe::ALL };
         let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, make).unwrap().1;
         // Nothing runs: at once, and two are made ahead, one a time.
         assert_eq!(take(&mut pool, at(0, 0)), 1);
@@ -713,6 +894,91 @@ mod tests {
         assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);
         assert_eq!(made.get(), n);
         assert!(pool.take(BLOCK, 65536, 0, make).is_none());
+    }
+
+    #[test]
+    fn no_block_is_made_without_room_for_a_texture_that_can_wait() {
+        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let ripe = |grow| Ripe { ahead: 2, grow, ..Ripe::ALL };
+        let quarter = BLOCK / 4;
+        let (first, _, _) = pool.take_ripe(quarter, 65536, 0, ripe(Grow::Yes), make).unwrap();
+        assert_eq!((pool.blocks(), made.get()), (2, 2));
+        for _ in 0..7 {
+            assert!(pool.take_ripe(quarter, 65536, 0, ripe(Grow::No), make).is_some());
+        }
+        assert_eq!((pool.blocks(), made.get()), (2, 2));
+        assert!(pool.take_ripe(quarter, 65536, 0, ripe(Grow::No), make).is_none());
+        assert_eq!(pool.no_fit, Some((quarter, 65536)));
+        assert!(pool.take_ripe(2 * quarter, 65536, 0, ripe(Grow::No), make).is_none());
+        assert!(pool.take_ripe(65536, 65536, 0, ripe(Grow::No), make).is_none());
+        assert_eq!(pool.no_fit, Some((65536, 65536)));
+        assert_eq!((pool.blocks(), made.get()), (2, 2));
+        assert!(pool.take_ripe(quarter, 65536, 0, ripe(Grow::Must), make).is_some());
+        assert_eq!((pool.blocks(), made.get()), (3, 3));
+        assert_eq!(pool.no_fit, None);
+        for _ in 0..3 {
+            assert!(pool.take_ripe(quarter, 65536, 0, ripe(Grow::No), make).is_some());
+        }
+        assert!(pool.take_ripe(quarter, 65536, 0, ripe(Grow::No), make).is_none());
+        pool.give(first, 0);
+        assert!(pool.take_ripe(quarter, 65536, REST - 1, ripe(Grow::No), make).is_none());
+        let (again, _, _) = pool.take_ripe(quarter, 65536, REST, ripe(Grow::No), make).unwrap();
+        assert_eq!((again.block, again.start), (first.block, first.start));
+        assert_eq!((pool.blocks(), made.get()), (3, 3));
+        assert!(!ripe(Grow::No).pooled(BLOCK + 1));
+        assert!(ripe(Grow::No).pooled(BLOCK));
+        assert!(!Ripe::ALL.pooled(BLOCK));
+    }
+
+    #[test]
+    fn the_fullest_block_with_room_is_taken_first() {
+        let mut pool: Pool<u64> = Pool::new(0);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let ripe = Ripe { fullest: true, ..Ripe::ALL };
+        let piece = BLOCK / 8;
+        let taken: Vec<Piece> = (0..24).map(|_| pool.take_ripe(piece, 65536, 0, ripe, make).unwrap().0).collect();
+        assert_eq!(pool.blocks(), 3);
+        let mut kept = Vec::new();
+        for (i, p) in taken.into_iter().enumerate() {
+            let keep = match p.block {
+                0 => i % 8 == 0,
+                1 => i % 8 < 6,
+                _ => i % 8 < 3,
+            };
+            if keep {
+                kept.push(p);
+            } else {
+                pool.give(p, 0);
+            }
+        }
+        pool.reclaim(REST, 0, true);
+        let rooms = |pool: &Pool<u64>| pool.blocks.iter().map(|b| b.as_ref().map_or(u64::MAX, |b| b.room / piece)).collect::<Vec<_>>();
+        assert_eq!(rooms(&pool), [7, 2, 5]);
+        let blocks: Vec<usize> = (0..7).map(|_| pool.take_ripe(piece, 65536, REST, ripe, make).unwrap().0.block).collect();
+        assert_eq!(blocks, [1, 1, 2, 2, 2, 2, 2]);
+        assert_eq!(rooms(&pool), [7, 0, 0]);
+        assert_eq!(pool.take_ripe(4 * piece, 65536, REST, ripe, make).unwrap().0.block, 0);
+        assert_eq!(made.get(), 3);
+        for p in kept.iter().filter(|p| p.block == 1).take(1) {
+            pool.give(*p, REST);
+        }
+        pool.reclaim(2 * REST, 0, true);
+        assert_eq!(pool.take(piece, 65536, 2 * REST, make).unwrap().0.block, 0);
+        assert_eq!(pool.take_ripe(piece, 65536, 2 * REST, ripe, make).unwrap().0.block, 1);
+        let mut other: Pool<u64> = Pool::new(0);
+        let only = other.take_ripe(piece, 65536, 0, ripe, make).unwrap().0;
+        other.give(only, 0);
+        other.reclaim(REST, 0, true);
+        assert_eq!((other.blocks(), other.given), (0, 1));
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not

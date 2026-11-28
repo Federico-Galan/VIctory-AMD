@@ -760,7 +760,7 @@ pub(crate) mod host;
 #[cfg(windows)]
 pub mod known;
 #[cfg(windows)]
-mod library;
+pub(crate) mod library;
 #[cfg(windows)]
 mod make;
 #[cfg(windows)]

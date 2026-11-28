@@ -504,6 +504,8 @@ fn library() -> Option<&'static Library> {
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
+            } else {
+                start_saver();
             }
             library
         })
@@ -620,6 +622,54 @@ pub(crate) fn pipeline(
         library.added.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pso)
+}
+
+/// How often the saver thread looks for pipelines not yet on disk
+/// (`SCARLETT_LIBRARY_SAVE_S`, seconds; 0 turns it off).
+fn saver_every() -> Option<std::time::Duration> {
+    let s = std::env::var("SCARLETT_LIBRARY_SAVE_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(30);
+    (s > 0).then(|| std::time::Duration::from_secs(s))
+}
+
+/// Whether the saver thread writes the library now: something was added and
+/// either enough pipelines are waiting or the last save is old enough.
+pub(crate) fn saver_due(added: u64, since_save: std::time::Duration, every: std::time::Duration) -> bool {
+    const ENOUGH: u64 = 64;
+    added > 0 && (added >= ENOUGH || since_save >= every)
+}
+
+/// A thread that keeps the library on disk while the title runs so killed
+/// runs do not lose newly compiled pipelines.
+fn start_saver() {
+    let Some(every) = saver_every() else { return };
+    let spawned = std::thread::Builder::new().name("victory-library-saver".into()).spawn(move || {
+        // SAFETY: a plain call on our own thread.
+        unsafe {
+            use windows::Win32::System::Threading::*;
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        }
+        let tick = std::time::Duration::from_secs(5).min(every);
+        let mut last = std::time::Instant::now();
+        loop {
+            std::thread::sleep(tick);
+            let Some(library) = library() else { return };
+            if saver_due(library.added.load(Ordering::Relaxed), last.elapsed(), every) {
+                save(true);
+                last = std::time::Instant::now();
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "no pipeline library saver");
+    }
+}
+
+/// Saves what the library holds once the host device is removed.
+pub(crate) fn save_on_removal() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::Relaxed) {
+        save(true);
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -1030,5 +1080,15 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn the_saver_writes_what_a_killed_run_would_lose() {
+        use std::time::Duration;
+        let every = Duration::from_secs(30);
+        assert!(!saver_due(0, Duration::from_secs(3600), every));
+        assert!(!saver_due(3, Duration::from_secs(10), every));
+        assert!(saver_due(3, every, every));
+        assert!(saver_due(64, Duration::ZERO, every));
     }
 }

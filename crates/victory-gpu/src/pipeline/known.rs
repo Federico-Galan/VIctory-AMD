@@ -519,4 +519,42 @@ mod tests {
         assert_eq!(seen, [(5, 9, 37, 4)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn key_text_leaves_out_unread_blend_fields_while_describe_keeps_them() {
+        let make = || {
+            let mut g = GraphicsState {
+                depth_format: DXGI_FORMAT_D32_FLOAT,
+                topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                ..Default::default()
+            };
+            g.targets.NumRenderTargets = 1;
+            g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            g.blend.RenderTarget[0].BlendEnable = true.into();
+            g.blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            g.blend.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            g
+        };
+
+        let g1 = make();
+        let mut g2 = make();
+        // Unused targets past NumRenderTargets=1 should not split the key.
+        g2.blend.RenderTarget[2] = g1.blend.RenderTarget[0];
+        g2.blend.RenderTarget[2].RenderTargetWriteMask = 0;
+
+        assert_ne!(g1.describe(), g2.describe());
+        assert_eq!(g1.key_text(), g2.key_text());
+
+        // IndependentBlendEnable when all active targets share RT[0] collapses too.
+        g2.targets.NumRenderTargets = 2;
+        g2.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g2.blend.IndependentBlendEnable = false.into();
+        let mut g3 = make();
+        g3.targets.NumRenderTargets = 2;
+        g3.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g3.blend.IndependentBlendEnable = true.into();
+        g3.blend.RenderTarget[1] = g3.blend.RenderTarget[0];
+        assert_ne!(g2.describe(), g3.describe());
+        assert_eq!(g2.key_text(), g3.key_text());
+    }
 }

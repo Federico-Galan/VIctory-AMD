@@ -17,6 +17,8 @@
 
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+pub mod external;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -99,10 +101,14 @@ mod upload;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
+mod wcskip;
+#[cfg(windows)]
 mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use wcskip::title_memory_reserved;
 
 /// Whether `switch` is on now, if it is one of those `SCARLETT_AB` turns on and
 /// off while the title runs (`ab`).

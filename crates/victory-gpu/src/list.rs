@@ -2449,3 +2449,30 @@ mod tests {
         }
     }
 }
+
+/// Whether `this` is a command list of ours.
+#[cfg(windows)]
+pub(crate) fn is_list(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // SAFETY: a title object's first word is its table; only read.
+    let table = unsafe { *this.cast::<*const *const ()>() };
+    table == LIST_FUNCTIONS.0.as_ptr()
+        || table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+        || table == THIN_FUNCTIONS.0.as_ptr()
+        || table == NEWER_THIN_FUNCTIONS.0.as_ptr()
+}
+
+/// Runs `f` on a title list's host list and draw state; `false` if `this` is not one
+/// of our lists or has no host list (a thin list, `VICTORY_THIN=1`).
+#[cfg(windows)]
+pub(crate) fn with_host(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) -> bool {
+    if !is_list(this) || host_list(this).is_none() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::warn!("FSR: a list without a host list (VICTORY_THIN=1?): the upscale is skipped"));
+        return false;
+    }
+    with_state(this, f);
+    true
+}

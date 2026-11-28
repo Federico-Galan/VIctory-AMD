@@ -638,6 +638,7 @@ pub(crate) fn removal_context() -> String {
 /// host device removed.
 pub(crate) fn log_removal_context() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    crate::pipeline::library::save_on_removal();
     if !(trail_on() || dred_any()) || SAID.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -3379,6 +3380,74 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether a draw that finds no free dynamic descriptor slot waits for the
+/// next landing without the submission lock (`SCARLETT_DYNAMIC_WAIT=1` /
+/// `VICTORY_DYNAMIC_WAIT=1`).
+fn dynamic_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("SCARLETT_DYNAMIC_WAIT")
+            .or_else(|| std::env::var_os("VICTORY_DYNAMIC_WAIT"))
+            .is_some_and(|v| v == "1")
+    })
+}
+
+static DYNAMIC_WAITS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Waits for dynamic descriptor slots without holding the submission lock when
+/// [`dynamic_wait`] and [`relay`] are active; falls back to [`settle_for_fence`]
+/// if no flight is in the air or slots remain unavailable.
+pub(crate) fn wait_for_slots(mut take: impl FnMut() -> Option<u32>) -> Option<u32> {
+    let began = std::time::Instant::now();
+    DYNAMIC_WAITS[0].fetch_add(1, Ordering::Relaxed);
+    let mut found = None;
+    if dynamic_wait() && relay() {
+        let _waiting = crate::timeline::span("waiting for landings: dynamic descriptor slots");
+        loop {
+            let nothing = {
+                let line = line();
+                line.line.is_empty() && !line.settling
+            };
+            found = take();
+            if found.is_some() || nothing {
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
+    if found.is_some() {
+        DYNAMIC_WAITS[2].fetch_add(1, Ordering::Relaxed);
+    } else {
+        DYNAMIC_WAITS[3].fetch_add(1, Ordering::Relaxed);
+        settle_for_fence();
+        found = take();
+        if found.is_none() {
+            DYNAMIC_WAITS[4].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    DYNAMIC_WAITS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    found
+}
+
+fn dynamic_wait_line(frames: f64) {
+    let w: Vec<f64> = DYNAMIC_WAITS.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let low = crate::descriptor::host::DYNAMIC_LOW[0].swap(u32::MAX, Ordering::Relaxed);
+    if low == u32::MAX && w[0] <= 0.0 {
+        return;
+    }
+    tracing::info!(
+        "dynamic descriptor slots: fewest free {} of {}; per frame {:.2} draws waited {:.1} ms ({:.2} after landing, {:.2} settled, {:.2} without; SCARLETT_DYNAMIC_WAIT={})",
+        if low == u32::MAX { 0 } else { low },
+        crate::descriptor::host::DYNAMIC_LOW[1].load(Ordering::Relaxed),
+        w[0],
+        w[1] / 1000.0,
+        w[2],
+        w[3],
+        w[4],
+        if dynamic_wait() && relay() { "on" } else { "off" }
+    );
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -3627,7 +3696,7 @@ struct RelayBack {
 fn relay_hand_back(back: &[Declared]) -> RelayBack {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.in_place() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -3802,6 +3871,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    dynamic_wait_line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -4027,7 +4097,7 @@ fn hand_back(back: &[Declared]) {
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
-            if shadow.carded() {
+            if shadow.carded() || shadow.in_place() {
                 continue;
             }
             let mut sorted = declared.clone();
@@ -4058,8 +4128,8 @@ fn hand_back(back: &[Declared]) {
         return;
     }
     for (shadow, declared) in back {
-        if shadow.carded() {
-            // Done before (`Host::card_back`).
+        if shadow.carded() || shadow.in_place() {
+            // Done before (`Host::card_back`), or nothing to do (in place).
             shadow.copy_back_done(declared);
             continue;
         }
@@ -4789,7 +4859,10 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && !seen.contains(&(copy, lo, hi)) {
+                        if lo < hi
+                            && !crate::wcskip::skip_back(r.shadow.span().1, r.declared, (hi - lo) as u64)
+                            && !seen.contains(&(copy, lo, hi))
+                        {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
                                 land::count(land::stat::HAD, 1);
@@ -5171,7 +5244,10 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                if lo < hi
+                    && !crate::wcskip::skip_back(r.shadow.span().1, r.declared, (hi - lo) as u64)
+                    && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
+                {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
@@ -9132,6 +9208,24 @@ impl Meter {
                 );
             }
             {
+                let [n, free, q0, h0, q1, h1, q2, h2, q3, h3, given] = crate::pool::fill();
+                let [made, not_made, past] = crate::pool::BLOCKS.each_ref().map(|b| b.load(Ordering::Relaxed));
+                let no_place = crate::draw::HEAP_TEXTURES_NO_PLACE[0].load(Ordering::Relaxed);
+                let no_place_now = crate::draw::HEAP_TEXTURES_NO_PLACE[1].swap(0, Ordering::Relaxed);
+                tracing::info!(
+                    "texture blocks: {n} blocks ({} MB), {} MB free; by how full: {q0} <=25% ({} MB), {q1} <=50% ({} MB), \
+                     {q2} <=75% ({} MB), {q3} >75% ({} MB); blocks {made} made, {not_made} gated, {past} past-gate, {given} given back; \
+                     textures waiting for a place: {no_place} ({no_place_now} now), full={}",
+                    n * 64,
+                    free >> 20,
+                    h0 >> 20,
+                    h1 >> 20,
+                    h2 >> 20,
+                    h3 >> 20,
+                    crate::pool::full()
+                );
+            }
+            {
                 let mode = crate::watch::page_writes();
                 let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
                 let [kept, dropped, slots, uploaded] =
@@ -9169,6 +9263,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -9176,7 +9271,8 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
+                 raw view clamp (past end, shortened, sub-dword, unaligned) since start: SRV {raw_srv:?}, UAV {raw_uav:?}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),

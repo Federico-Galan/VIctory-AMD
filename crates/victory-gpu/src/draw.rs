@@ -514,9 +514,9 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap, host heap id, first,
+    /// count; given back when the list has run, is reset or released.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -533,8 +533,8 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, id, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
     }
 }
@@ -555,8 +555,8 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for (heap, id, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
         self.fresh_tables.clear();
         self.recording = 0;
@@ -806,6 +806,7 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HEAP_TEXTURES_NO_PLACE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
@@ -2023,13 +2024,10 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = host.dynamic(1).or_else(|| crate::host::wait_for_slots(|| host.dynamic(1))) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -2097,13 +2095,10 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = host.dynamic(1).or_else(|| crate::host::wait_for_slots(|| host.dynamic(1))) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -2914,6 +2909,24 @@ impl State {
                 served = false;
                 break;
             }
+            // The card has no room for a new block of textures
+            // (`crate::pool::gate`): try free places in existing blocks before
+            // mirroring/staging; if none fits, defer the slot and keep its
+            // older view.
+            if room && crate::pool::full() && !baking && sync.is_none() && !required {
+                let held = heap.handle(index).and_then(crate::descriptor::view);
+                let wanted = held.as_ref().and_then(crate::descriptor::host::placed_texture).or(held);
+                if let Some(View::Shader(wanted, _)) = wanted
+                    && crate::resource::title_fills(wanted as This)
+                    && let (None, true) = crate::pool::waiting(|| crate::resource::host_resource(wanted as This))
+                {
+                    for count in &HEAP_TEXTURES_NO_PLACE {
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    host.texture_slot_later(index, write, frame, most);
+                    continue;
+                }
+            }
             // A slot that shows the texture by an earlier view of it (one
             // from another level) goes on doing so until the upload of what
             // the new one shows has run.
@@ -3290,7 +3303,7 @@ impl State {
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
-            && crate::ambient::on()
+            && crate::ambient::on(role)
             && self.ambient(list, p, role)
         {
             self.host_pipeline = 0;
@@ -3327,19 +3340,53 @@ impl State {
             let host = crate::resource::host_resource(resource as This)?;
             // SAFETY: a live resource.
             let desc = unsafe { host.GetDesc() };
-            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+            Some((desc, heap.gpu_handle((start + offset * 4) / 32), resource))
         };
+        if role == Role::Gather {
+            // Each place the light from behind may be written to, once an
+            // image: the program's own register there, and an image of a
+            // format that form of the light can have.
+            let mut cleared: Vec<usize> = Vec::new();
+            let mut recorded = false;
+            for (slot, offset, register) in crate::ambient::BACKLIGHT {
+                let ours = t.used.iter().any(|u| {
+                    u.kind == ResourceType::Uav
+                        && u.root == RootType::Table
+                        && (u.slot, u.table_offset_dwords, u.lower_bound) == (slot, offset, register)
+                });
+                let Some((of, image, resource)) = entry(ResourceType::Uav, (slot, offset)).filter(|_| ours) else {
+                    continue;
+                };
+                let plane = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                let Some(form) = crate::ambient::backlight_form(offset, of.Format.0).filter(|_| plane) else {
+                    continue;
+                };
+                if cleared.contains(&resource) {
+                    continue;
+                }
+                cleared.push(resource);
+                if !crate::ambient::clear_backlight(list, image, [of.Width as u32, of.Height], form, offset) {
+                    break;
+                }
+                recorded = true;
+            }
+            if !recorded {
+                once!("translucent surfaces' light from behind left as it is: another image or other tables");
+            }
+            return recorded;
+        }
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Gather => return false,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Gather => image,
         };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+        let (Some((of, image, _)), Some((seen, depth, _))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
@@ -3891,10 +3938,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(n)
-            }) else {
+            let Some(first) = host.dynamic(n).or_else(|| crate::host::wait_for_slots(|| host.dynamic(n))) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
@@ -3902,7 +3946,7 @@ impl State {
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -4538,6 +4582,18 @@ impl State {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
+        }
+        // The final gather is dispatched this way: its light from behind is
+        // cleared here too (`crate::ambient`; the stand-in's own passes follow
+        // direct dispatches only, as before).
+        let role = p.stages.first().and_then(|s| s.shader.ambient);
+        if kind == DISPATCH
+            && role == Some(crate::ambient::Role::Gather)
+            && crate::ambient::on(crate::ambient::Role::Gather)
+            && self.ambient(list, p, crate::ambient::Role::Gather)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
         }
         true
     }
